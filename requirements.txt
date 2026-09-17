@@ -1,0 +1,11 @@
+# Install torch separately first, matched to your CUDA version:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+transformers>=4.44.0
+accelerate>=0.33.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0
+pydantic>=2.7.0
+
+# Install after confirming check_env.py --skip-vllm passes:
+# vllm>=0.5.4
