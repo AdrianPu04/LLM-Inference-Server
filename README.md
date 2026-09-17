@@ -11,11 +11,11 @@ python -m venv venv
 # Windows: venv\Scripts\activate
 source venv/bin/activate
 
-pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 
 # Optional: CUDA / VRAM (and later vLLM) check
-python check_env.py --skip-vllm
+python scripts/check_env.py --skip-vllm
 ```
 
 ## Servers
