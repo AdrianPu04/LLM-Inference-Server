@@ -9,6 +9,11 @@ Usage:
     python load_test.py --url http://localhost:8000/generate \
         --concurrency 1 2 4 8 16 32 --requests-per-level 20 \
         --out results/naive_1.5b.json
+
+    # Mixed lengths (cycles 32 / 128 / 256 across requests):
+    python load_test.py --url http://localhost:8000/generate \
+        --concurrency 1 2 4 8 16 32 --max-new-tokens 32 128 256 \
+        --out results/continuous_mixed.json
 """
 
 import argparse
@@ -47,12 +52,13 @@ async def single_request(client: httpx.AsyncClient, url: str, prompt: str, max_n
         return {"success": False, "wall_latency_s": wall_latency, "error": str(e)}
 
 
-async def run_level(url: str, concurrency: int, n_requests: int, max_new_tokens: int):
+async def run_level(url: str, concurrency: int, n_requests: int, max_new_tokens: list[int]):
     async with httpx.AsyncClient() as client:
         tasks = []
         for i in range(n_requests):
             prompt = PROMPTS[i % len(PROMPTS)]
-            tasks.append(single_request(client, url, prompt, max_new_tokens))
+            tokens = max_new_tokens[i % len(max_new_tokens)]
+            tasks.append(single_request(client, url, prompt, tokens))
 
         sem = asyncio.Semaphore(concurrency)
 
@@ -87,6 +93,7 @@ async def run_level(url: str, concurrency: int, n_requests: int, max_new_tokens:
         "p90_latency_s": pct(0.90),
         "p99_latency_s": pct(0.99),
         "mean_latency_s": statistics.mean(latencies) if latencies else None,
+        "max_new_tokens": max_new_tokens,
     }
     return summary
 
@@ -96,11 +103,18 @@ async def main():
     parser.add_argument("--url", required=True)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--requests-per-level", type=int, default=20)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        nargs="+",
+        default=[128],
+        help="One value = fixed length; several values cycle per request (mixed length)",
+    )
     parser.add_argument("--out", default=None, help="Optional path to dump JSON results")
     args = parser.parse_args()
 
     all_results = []
+    print(f"max_new_tokens={args.max_new_tokens}")
     print(f"{'concurrency':>12} {'req/s':>8} {'tok/s':>10} {'p50':>8} {'p90':>8} {'p99':>8} {'fail':>6}")
     for c in args.concurrency:
         summary = await run_level(args.url, c, args.requests_per_level, args.max_new_tokens)
