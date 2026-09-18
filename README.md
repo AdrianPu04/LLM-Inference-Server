@@ -2,6 +2,8 @@
 
 HuggingFace inference servers with a shared `POST /generate` API and a load-test harness for throughput/latency under concurrency.
 
+Design notes and benchmark discussion: [WRITEUP.md](WRITEUP.md).
+
 Default model: `Qwen/Qwen2.5-1.5B-Instruct` (fits a 12–16GB GPU). Override with `MODEL_NAME`.
 
 ## Setup
