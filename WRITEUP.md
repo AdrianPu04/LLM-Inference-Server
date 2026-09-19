@@ -1,14 +1,17 @@
 # Writeup: Building an LLM Inference Server
 
-This project implements and benchmarks three serving strategies for the same
-HuggingFace causal LM behind a shared FastAPI `POST /generate` API:
+This project implements and benchmarks serving strategies for HuggingFace
+causal LMs behind a shared FastAPI `POST /generate` API:
 
 1. **Naive** — one request at a time  
 2. **Static batching** — fixed batch for a whole `generate()` call  
 3. **Continuous batching** — iteration-level scheduling with in-place KV  
+4. **Quantized continuous** — same continuous scheduler with 4-bit weights (BnB NF4)
 
-Hardware: NVIDIA RTX 4070 (12 GB). Model: `Qwen/Qwen2.5-1.5B-Instruct` (fp16).  
-Load test: 20 requests per concurrency level `{1,2,4,8,16,32}` via `scripts/load_test.py`.
+Hardware: NVIDIA RTX 4070 (12 GB). Primary model: `Qwen/Qwen2.5-1.5B-Instruct`
+(fp16), plus BnB runs on 1.5B and `Qwen/Qwen2.5-7B-Instruct`.  
+Load test: 20 requests per concurrency level via `scripts/load_test.py`
+(typically `{1,2,4,8,16,32}`; 7B used up to 16).
 
 Raw JSON: `results/`. How to run: [README.md](README.md).
 
@@ -126,6 +129,63 @@ batch’s `max_new_tokens`, which further couples shorts to longs).
 
 ---
 
+## Phase 4 — Quantization (bitsandbytes NF4)
+
+`server/quantized_server.py` reuses the continuous GPU-worker scheduler but loads
+weights in 4-bit. The plan called for AWQ/GPTQ; on Windows `autoawq` could not
+install (Triton dependency), so the default path is **bitsandbytes NF4** on the
+full Instruct checkpoint at load time. AWQ/GPTQ remain wired for Linux/GKE.
+
+BnB packs weights as NF4 (with double quantization); matmuls still run in fp16
+after on-the-fly dequant. The KV cache is **not** 4-bit — VRAM savings are mostly
+on weights.
+
+### 1.5B: fp16 continuous vs BnB continuous
+
+Same model size and scheduler; only the weight format changes.
+
+| concurrency | fp16 req/s | BnB req/s | fp16 p50 | BnB p50 | fp16 p99 | BnB p99 |
+|------------:|-----------:|----------:|---------:|--------:|---------:|--------:|
+| 4 | 1.31 | 0.92 | 2.99 | 4.31 | 3.25 | 4.50 |
+| 8 | **2.04** | 1.36 | 3.27 | 5.16 | 3.53 | 5.20 |
+| 16 | 1.67 | 1.40 | 8.01 | 9.01 | 8.07 | 10.26 |
+| 32 | 1.56 | 1.39 | 8.69 | 10.10 | 12.78 | 14.38 |
+
+| | fp16 continuous | BnB 1.5B |
+|--|-----------------|----------|
+| Peak req/s | ~2.0 | ~1.4 |
+| Peak tok/s | ~261 | ~179 |
+| Load VRAM (approx.) | ~3 GiB weights | **~1.1 GiB** |
+
+On a 1.5B model that already fit in fp16, 4-bit is a **memory win and a speed
+loss** (~30% slower at the sweet spot) because of dequant overhead.
+
+### 7B: what quantization is actually for
+
+fp16 ~7B does not fit comfortably on 12 GB. With BnB:
+
+```text
+MODEL_NAME=Qwen/Qwen2.5-7B-Instruct  QUANT_METHOD=bnb
+peak_vram ≈ 5.30 GiB at load
+```
+
+Uniform load (`max_new_tokens=128`, concurrency through 16):
+
+| concurrency | req/s | tok/s | p50 (s) | p99 (s) |
+|------------:|------:|------:|--------:|--------:|
+| 1 | 0.19 | 24.3 | 5.16 | 6.30 |
+| 2 | 0.40 | 50.9 | 5.10 | 5.35 |
+| 4 | 0.69 | 87.9 | 5.90 | 5.96 |
+| 8 | **1.08** | **137.6** | 6.28 | 6.51 |
+| 16 | 1.06 | 135.7 | 12.19 | 12.98 |
+
+The 7B BnB server is slower than 1.5B fp16 (expected: more compute per token),
+but it **runs at all** on the same card, peaking ~1.1 req/s with the continuous
+scheduler intact and zero failures through c=16. That is the Phase 4 payoff:
+quantization unlocks a larger model, not a faster tiny one.
+
+---
+
 ## What I learned
 
 1. **Batching dominates locking.** Naive → static was the largest single jump.  
@@ -135,13 +195,16 @@ batch’s `max_new_tokens`, which further couples shorts to longs).
 3. **Benchmark design matters.** Uniform lengths hide continuous’s advantage;
    mixed lengths reveal it.  
 4. **Platform constraints are part of the story.** Skipping broken Windows vLLM
-   and shipping a custom scheduler was the right call for this machine.
+   and preferring BnB over AWQ on this machine were the right calls.  
+5. **Quantization is about fit, not free speed.** On 1.5B, BnB traded ~30%
+   throughput for ~⅓ the weight VRAM; on 7B, the same path made a previously
+   impractical model serveable (~5.3 GiB load).
 
 ---
 
 ## Next steps
 
-- **Quantization (AWQ/GPTQ 4-bit):** same API and harness; compare VRAM and
-  throughput, optionally larger models on 12 GB.  
-- **GKE / Linux:** deploy and add a real vLLM baseline on identical hardware.  
-- Optional: latency broken out by length bucket for mixed tests.
+- **GKE / Linux:** deploy and add a real vLLM (+ optional AWQ) baseline on
+  identical hardware.  
+- Optional: latency broken out by length bucket for mixed tests; longer 7B
+  concurrency sweeps if VRAM allows.

@@ -7,5 +7,10 @@ uvicorn[standard]>=0.30.0
 httpx>=0.27.0
 pydantic>=2.7.0
 
+# Phase 4 — quantization:
+bitsandbytes>=0.43.0            # QUANT_METHOD=bnb (default; works on Windows)
+# autoawq>=0.2.6                # QUANT_METHOD=awq (needs Triton → Linux)
+# auto-gptq>=0.7.0              # QUANT_METHOD=gptq (Linux preferred)
+
 # Install after confirming scripts/check_env.py --skip-vllm passes:
 # vllm>=0.5.4

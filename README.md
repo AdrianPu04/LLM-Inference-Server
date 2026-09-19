@@ -28,16 +28,29 @@ vLLM does not import cleanly on this Windows setup (`vllm._C_stable_libtorch` mi
 | Naive | `uvicorn server.naive_server:app --host 0.0.0.0 --port 8000` | One request at a time (async lock around `.generate()`) |
 | Static batch | `uvicorn server.static_batch_server:app --host 0.0.0.0 --port 8000` | Collect requests for up to 30ms / batch of 8 → one padded `generate()` |
 | Continuous batch | `uvicorn server.continuous_batch_server:app --host 0.0.0.0 --port 8000` | Iteration-level scheduling on a GPU worker thread; in-place batched KV |
+| Quantized continuous | `uvicorn server.quantized_server:app --host 0.0.0.0 --port 8000` | Same continuous scheduler with AWQ / BnB / GPTQ 4-bit weights |
 
 | Knob | Default | Applies to |
 |------|---------|------------|
-| `MAX_BATCH_SIZE` | `8` | static, continuous |
+| `MAX_BATCH_SIZE` | `8` | static, continuous, quantized |
 | `BATCH_TIMEOUT_MS` | `30` | static |
-| `DECODE_BURST` | `64` | continuous |
-| `TORCH_COMPILE` | `0` | continuous |
-| `MAX_SEQ_LEN` | `2048` | continuous |
+| `DECODE_BURST` | `64` | continuous, quantized |
+| `TORCH_COMPILE` | `0` | continuous, quantized |
+| `MAX_SEQ_LEN` | `2048` | continuous, quantized |
+| `QUANT_METHOD` | `bnb` | quantized (`bnb` \| `awq` \| `gptq`) |
+| `MODEL_NAME` | (see below) | all |
 
-Continuous keeps a batched KV cache across decode steps (rebuilds only when requests join/leave) so asyncio is not on the per-token hot path.
+Quantized defaults: `bnb` → base Instruct + NF4 (Windows-friendly); `awq` / `gptq` → pre-quantized HF checkpoints (typically Linux; `autoawq` needs Triton).
+
+```powershell
+pip install bitsandbytes
+uvicorn server.quantized_server:app --host 0.0.0.0 --port 8000
+
+# On Linux, AWQ checkpoint instead:
+# pip install autoawq
+# $env:QUANT_METHOD="awq"
+# uvicorn server.quantized_server:app --host 0.0.0.0 --port 8000
+```
 
 ### API
 
@@ -65,6 +78,13 @@ python scripts/load_test.py \
   --concurrency 1 2 4 8 16 32 \
   --max-new-tokens 32 128 256 \
   --out results/continuous_mixed.json
+
+# Quantized continuous (compare to continuous_batch.json)
+python scripts/load_test.py \
+  --url http://localhost:8000/generate \
+  --concurrency 1 2 4 8 16 32 \
+  --requests-per-level 20 \
+  --out results/quantized_bnb.json
 ```
 
 ## Results
@@ -73,11 +93,15 @@ python scripts/load_test.py \
 |------|----------------|
 | `results/naive_baseline.json` | Naive, fixed 128 tokens |
 | `results/static_batch.json` | Static, fixed 128 |
-| `results/continuous_batch.json` | Continuous, fixed 128 |
+| `results/continuous_batch.json` | Continuous fp16 1.5B, fixed 128 |
 | `results/static_mixed.json` | Static, mixed 32/128/256 |
-| `results/continuous_mixed.json` | Continuous, mixed 32/128/256 |
+| `results/continuous_mixed.json` | Continuous fp16 1.5B, mixed 32/128/256 |
+| `results/quantized_bnb.json` | Continuous BnB NF4 1.5B, fixed 128 |
+| `results/quantized_bnb_7b.json` | Continuous BnB NF4 7B, fixed 128 (c≤16) |
 
-**Headline findings (4070, Qwen2.5-1.5B):**
+**Headline findings (4070):**
 - Naive throughput stays ~flat (~0.37 req/s) while p99 climbs with concurrency.
-- Static batching raises peak throughput to ~2.3 req/s on uniform load.
-- Continuous matches/beats static around moderate concurrency on uniform load, and **clearly wins on mixed lengths** (~1.8–1.9× static req/s, much lower p50) because short requests can leave mid-decode.
+- Static batching raises peak throughput to ~2.3 req/s on uniform 1.5B fp16.
+- Continuous matches/beats static around moderate concurrency on uniform load, and **clearly wins on mixed lengths** (~1.8–1.9× static req/s, much lower p50).
+- BnB 4-bit on 1.5B cuts weight VRAM (~1.1 vs ~3 GiB) but is ~30% slower than fp16 continuous.
+- BnB enables **Qwen2.5-7B-Instruct** on the same 12 GB card (~5.3 GiB load, ~1.1 req/s peak) — the real quantization win.

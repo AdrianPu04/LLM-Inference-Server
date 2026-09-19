@@ -1,0 +1,82 @@
+[
+  {
+    "concurrency": 1,
+    "n_requests": 20,
+    "n_success": 20,
+    "n_failure": 0,
+    "wall_time_s": 105.3578708999994,
+    "throughput_req_per_s": 0.18982919670978388,
+    "throughput_tokens_per_s": 24.298137178852336,
+    "p50_latency_s": 5.1647320999982185,
+    "p90_latency_s": 5.829553199997463,
+    "p99_latency_s": 6.300325100004557,
+    "mean_latency_s": 5.267875004999587,
+    "max_new_tokens": [
+      128
+    ]
+  },
+  {
+    "concurrency": 2,
+    "n_requests": 20,
+    "n_success": 20,
+    "n_failure": 0,
+    "wall_time_s": 50.324683099999675,
+    "throughput_req_per_s": 0.3974192934361494,
+    "throughput_tokens_per_s": 50.86966955982712,
+    "p50_latency_s": 5.100932000001194,
+    "p90_latency_s": 5.34591179999552,
+    "p99_latency_s": 5.345942699997977,
+    "mean_latency_s": 5.032404909999968,
+    "max_new_tokens": [
+      128
+    ]
+  },
+  {
+    "concurrency": 4,
+    "n_requests": 20,
+    "n_success": 20,
+    "n_failure": 0,
+    "wall_time_s": 29.13165370000206,
+    "throughput_req_per_s": 0.6865384370540758,
+    "throughput_tokens_per_s": 87.8769199429217,
+    "p50_latency_s": 5.895268899999792,
+    "p90_latency_s": 5.962249299998803,
+    "p99_latency_s": 5.962512899997819,
+    "mean_latency_s": 5.826102999999785,
+    "max_new_tokens": [
+      128
+    ]
+  },
+  {
+    "concurrency": 8,
+    "n_requests": 20,
+    "n_success": 20,
+    "n_failure": 0,
+    "wall_time_s": 18.598607200001425,
+    "throughput_req_per_s": 1.0753493412129522,
+    "throughput_tokens_per_s": 137.64471567525788,
+    "p50_latency_s": 6.284634099996765,
+    "p90_latency_s": 6.508042599998589,
+    "p99_latency_s": 6.508155600000464,
+    "mean_latency_s": 6.277997624999261,
+    "max_new_tokens": [
+      128
+    ]
+  },
+  {
+    "concurrency": 16,
+    "n_requests": 20,
+    "n_success": 20,
+    "n_failure": 0,
+    "wall_time_s": 18.866074799996568,
+    "throughput_req_per_s": 1.0601039279248292,
+    "throughput_tokens_per_s": 135.69330277437814,
+    "p50_latency_s": 12.187370599996939,
+    "p90_latency_s": 12.981104500002402,
+    "p99_latency_s": 12.98136639999575,
+    "mean_latency_s": 10.300975760000075,
+    "max_new_tokens": [
+      128
+    ]
+  }
+]
