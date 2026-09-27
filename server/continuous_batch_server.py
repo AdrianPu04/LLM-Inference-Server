@@ -12,7 +12,7 @@ Run:
 
 Knobs (env):
     MODEL_NAME       default Qwen/Qwen2.5-1.5B-Instruct
-    MAX_BATCH_SIZE   default 8
+    MAX_BATCH_SIZE   default 32
     MAX_SEQ_LEN      default 2048
     DECODE_BURST     default 64
     TORCH_COMPILE    default 0
@@ -34,7 +34,7 @@ from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
-MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "8"))
+MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "32"))
 MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", "2048"))
 DECODE_BURST = int(os.environ.get("DECODE_BURST", "64"))
 TORCH_COMPILE = os.environ.get("TORCH_COMPILE", "0").strip().lower() in {"1", "true", "yes", "on"}

@@ -9,7 +9,7 @@ Run:
 
 Knobs (env):
     MODEL_NAME          default Qwen/Qwen2.5-1.5B-Instruct
-    MAX_BATCH_SIZE      default 8
+    MAX_BATCH_SIZE      default 32
     BATCH_TIMEOUT_MS    default 30
 """
 
@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
-MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "8"))
+MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "32"))
 BATCH_TIMEOUT_S = int(os.environ.get("BATCH_TIMEOUT_MS", "30")) / 1000.0
 
 state: dict = {}

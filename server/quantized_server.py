@@ -43,7 +43,7 @@ if QUANT_METHOD not in _DEFAULT_MODELS:
     raise SystemExit(f"QUANT_METHOD must be one of {list(_DEFAULT_MODELS)}, got {QUANT_METHOD!r}")
 
 MODEL_NAME = os.environ.get("MODEL_NAME", _DEFAULT_MODELS[QUANT_METHOD])
-MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "8"))
+MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "32"))
 MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", "2048"))
 DECODE_BURST = int(os.environ.get("DECODE_BURST", "64"))
 TORCH_COMPILE = os.environ.get("TORCH_COMPILE", "0").strip().lower() in {"1", "true", "yes", "on"}
