@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-server
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 1800
+  # One GPU per node: a rolling update would wait forever for the old pod to release it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: llm-server
+  template:
+    metadata:
+      labels:
+        app: llm-server
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-l4
+      containers:
+        - name: server
+          image: __IMAGE__
+          env:
+            - name: SERVER
+              value: "__SERVER__"
+            - name: MODEL_NAME
+              value: "__MODEL__"
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+            limits:
+              memory: 24Gi
+              nvidia.com/gpu: 1
+          # uvicorn only listens after the model has loaded, so /health doubles as "model ready".
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: models
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-server
+spec:
+  selector:
+    app: llm-server
+  ports:
+    - port: 8000
+      targetPort: 8000

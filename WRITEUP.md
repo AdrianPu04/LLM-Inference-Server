@@ -7,14 +7,15 @@ causal LMs behind a shared FastAPI `POST /generate` API:
 2. **Static batching** — fixed batch for a whole `generate()` call  
 3. **Continuous batching** — iteration-level scheduling with in-place KV  
 4. **Quantized continuous** — same continuous scheduler with 4-bit weights (BnB NF4)
-5. **Containerized + vLLM baseline** — the servers in Docker (Linux), benchmarked
-   against vLLM on the same GPU
+5. **Containerized + vLLM baseline** — the servers in Docker, benchmarked against
+   vLLM locally and on GKE (NVIDIA L4)
 
-Hardware: NVIDIA RTX 4070 (12 GB). Primary model: `Qwen/Qwen2.5-1.5B-Instruct`
-(fp16), plus BnB runs on 1.5B and `Qwen/Qwen2.5-7B-Instruct`.  
-Load test: 20 requests per concurrency level via `scripts/load_test.py`
-(typically `{1,2,4,8,16,32}`; 7B used up to 16). Phases 1–4 ran natively on
-Windows; Phase 5 ran in Docker (WSL2 backend) on the same card.
+Hardware: NVIDIA RTX 4070 (12 GB) locally; one NVIDIA L4 (24 GB, `g2-standard-8`)
+on GKE. Primary model: `Qwen/Qwen2.5-1.5B-Instruct` (fp16), plus BnB runs on 1.5B
+and `Qwen/Qwen2.5-7B-Instruct`.  
+Load test: `scripts/load_test.py` at concurrency `{1,2,4,8,16,32}` (7B up to 16).
+Local runs used 20 requests per level. GKE used 100 for our server and 50 for vLLM.
+Phases 1–4 ran natively on Windows; Phase 5 ran in Docker (WSL2) on the 4070, then on GKE.
 
 Raw JSON: `results/`. How to run: [README.md](README.md).
 
@@ -258,10 +259,73 @@ Caveats:
 - 20 requests per level is thin. At c=32 fewer than 32 requests are ever in
   flight, and vLLM finishes a whole level in about a second, so its high-concurrency
   rows are noisy (mixed-load default vs capped is closer than it should be for
-  this reason). The GKE runs should use more requests per level.
+  this reason). The GKE runs below use 50–100 requests per level.
 - vLLM averaged ~116 completion tokens per 128-token request vs exactly 128 for
   ours. It stops on both of Qwen's EOS tokens and applies the model's
   `generation_config`. tok/s is the fairer comparison, and it tells the same story.
+
+### GKE: the same comparison on an NVIDIA L4
+
+`deploy/` stands up a zonal GKE cluster with a Spot `g2-standard-8` + L4 pool that
+scales 0–1, and pushes the image to Artifact Registry. `bench.ps1` deploys one
+server at a time and runs the load test from a pod inside the cluster, so no
+internet hop shows up in the latency numbers. `teardown.ps1` deletes it all. The
+whole session (setup, three benchmark runs, and debugging) cost a couple of dollars.
+
+Uniform load (`max_new_tokens=128`):
+
+| concurrency | ours req/s | vLLM (8 seqs) req/s | vLLM (default) req/s | ours p50 | vLLM default p50 |
+|------------:|-----------:|--------------------:|---------------------:|---------:|-----------------:|
+| 1 | 0.21 | 0.64 | 0.64 | 4.85 | 1.71 |
+| 8 | 1.26 | 4.59 | 4.63 | 6.10 | 1.78 |
+| 16 | 1.27 | 4.63 | 8.68 | 12.22 | 1.82 |
+| 32 | 1.26 | 4.61 | **12.82** | 24.36 | **2.04** |
+
+Mixed load (32 / 128 / 256):
+
+| concurrency | ours req/s | vLLM (8 seqs) req/s | vLLM (default) req/s | ours p50 | vLLM default p50 |
+|------------:|-----------:|--------------------:|---------------------:|---------:|-----------------:|
+| 1 | 0.19 | 0.64 | 0.64 | 4.85 | 1.71 |
+| 8 | 1.12 | 4.41 | 4.46 | 6.17 | 1.78 |
+| 16 | 1.13 | 4.37 | 6.95 | 12.40 | 1.80 |
+| 32 | 1.13 | 4.36 | **10.36** | 24.92 | **1.94** |
+
+| Peak tok/s | ours | vLLM (8 seqs) | vLLM (default) |
+|------------|-----:|--------------:|---------------:|
+| Uniform | 162 | 537 | 1484 |
+| Mixed | 156 | 516 | 1210 |
+
+With more requests per level, the curves are much cleaner than the local runs:
+
+- **The batch cap is plainly visible.** Our server and capped vLLM both go flat
+  at c=8. Past that, extra clients only queue, and our p50 doubles with each
+  doubling of concurrency (6 s, then 12 s, then 24 s). Uncapped vLLM keeps
+  scaling: 12.8 req/s at c=32 with p50 still ~2 s.
+- **The gap is wider on the L4 than on the 4070.** At the same batch cap vLLM is
+  3.6–3.9× faster (vs 2.3–3× locally). Uncapped at c=32 it's about 10× (vs ~6.7×).
+- **Our server is CPU-bound, not GPU-bound.** Moving from the 4070 to the L4, vLLM
+  slowed ~1.4× at c=1, roughly in line with the L4's lower memory bandwidth
+  (~300 vs ~500 GB/s). Ours slowed ~2×. At c=1 it made ~26 tok/s (~38 ms/token),
+  far slower than the ~10 ms/token that streaming 3 GB of weights at 300 GB/s
+  would take. The per-token cost is Python and kernel-launch overhead, and it
+  got worse on the cloud VM's slower server cores than on a desktop CPU. vLLM's
+  CUDA graphs replay a whole decode step with a single launch, so it barely
+  notices the CPU.
+
+Deploying surfaced three bugs that never appeared locally:
+
+1. **"Found no NVIDIA driver."** GKE mounts the host driver at
+   `/usr/local/nvidia/lib64` and expects the image to have it on
+   `LD_LIBRARY_PATH`. CUDA base images set that; `python:3.12-slim` doesn't.
+   Docker Desktop injects the driver into default paths, which hid the problem.
+   Fixed in the `Dockerfile`.
+2. **Rollouts deadlocked.** The default rolling update starts the new pod before
+   stopping the old one. With one GPU per node, the new pod waits forever for a
+   GPU the old pod holds. Fixed with `strategy: Recreate`.
+3. **vLLM crash-looped.** A Service named `vllm` makes Kubernetes inject
+   `VLLM_PORT=tcp://<ip>:8000` into pods. vLLM reads `VLLM_PORT` as its own
+   setting and rejects the URI. Fixed with `enableServiceLinks: false`. A longer
+   `progressDeadlineSeconds` also covers the 8.7 GB image pull.
 
 ---
 
@@ -280,17 +344,25 @@ Caveats:
    impractical model serveable (~5.3 GiB load).
 6. **The scheduler is only half of a serving engine.** Continuous batching got
    our server to static's throughput with better latency, but vLLM at the *same*
-   batch size is still 2–3× faster. The rest comes from the execution path
+   batch size is still 2–4× faster. The rest comes from the execution path
    (CUDA graphs, fused kernels) and from a KV cache that makes big batches cheap.
+7. **Know which resource you're bound by.** On paper the L4 predicted a ~1.4×
+   slowdown, and vLLM matched it. Our server slowed 2×, which showed it was
+   limited by CPU overhead, not the GPU. Moving to "better" cloud hardware
+   exposed that.
+8. **"Works in Docker locally" isn't "works on Kubernetes."** Driver paths,
+   rollout strategy with scarce GPUs, and service-link env vars each broke the
+   first deploy. None of them showed up on a desktop.
 
 ---
 
 ## Next steps
 
-- **GKE:** run naive / ours / vLLM on an L4 node with more requests per level.
 - **AWQ in the container:** `autoawq` should install on Linux, giving the
   AWQ vs BnB comparison Phase 4 skipped.
 - **Close the per-step gap:** try `TORCH_COMPILE=1` / CUDA graphs on the decode
   step, and a larger `MAX_BATCH_SIZE`, to see how much of vLLM's lead is
-  reachable from HuggingFace code.
+  reachable from HuggingFace code. The GKE results say CPU overhead is the
+  first target.
+- **Naive and static on GKE** for a complete L4 ladder (`bench.ps1 -Server ...`).
 - Optional: latency broken out by length bucket for mixed tests.

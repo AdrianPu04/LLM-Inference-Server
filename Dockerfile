@@ -17,6 +17,10 @@ RUN pip install -r requirements.txt
 COPY server/ server/
 COPY scripts/ scripts/
 
+# GKE mounts the host NVIDIA driver here; CUDA base images set this, python:slim does not.
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/nvidia/lib \
+    PATH=/usr/local/nvidia/bin:$PATH
+
 EXPOSE 8000
 VOLUME ["/models"]
 

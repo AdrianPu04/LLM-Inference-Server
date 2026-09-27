@@ -68,6 +68,37 @@ docker run --gpus all -p 8000:8000 -v hf-cache:/models \
   llm-inference-server
 ```
 
+### GKE (L4 GPU)
+
+`deploy/` holds PowerShell scripts plus manifests that stand up a small GKE cluster with one NVIDIA L4 node pool and benchmark servers on it.
+
+Prerequisites:
+- `gcloud` installed and logged in (`gcloud init`).
+- The kubectl auth plugin: `gcloud components install gke-gcloud-auth-plugin`. On Windows, if gcloud refuses to update itself, first run `$env:CLOUDSDK_PYTHON = (gcloud components copy-bundled-python).Trim()`.
+- A project with billing enabled. Free-trial accounts can't use GPUs until upgraded.
+- GPU quota ≥ 1 for both **GPUs (all regions)** and **L4 GPUs** in the region (IAM → Quotas). New projects start the all-regions quota at 0.
+- A budget alert set in Billing.
+
+```powershell
+.\deploy\setup.ps1              # APIs, Artifact Registry, image push, cluster + L4 Spot pool (-OnDemand for non-Spot)
+
+.\deploy\bench.ps1 -Target server                                  # continuous (default)
+.\deploy\bench.ps1 -Target server -Server static_batch_server
+.\deploy\bench.ps1 -Target vllm
+.\deploy\bench.ps1 -Target vllm -VllmArgs "--max-num-seqs 8" -Label vllm_seqs8
+
+.\deploy\teardown.ps1           # delete the cluster; -DeleteImages also removes the registry repo
+```
+
+How the pieces fit:
+- The GPU pool scales 0–1, so only one server runs at a time. `bench.ps1` deletes the other deployment before starting the new one.
+- The load test runs from a pod inside the cluster, so the latencies include no internet hop.
+- Each run writes two files: `results/gke_<label>.json` (uniform 128 tokens) and `results/gke_<label>_mixed.json`. The default is 100 requests per level; change it with `-Requests`. Our continuous server takes ~35 min at 100; vLLM at 50 takes a few minutes.
+- The first deploy takes 10–15 min, covering GPU node scale-up, driver install, image pull and model load.
+- Settings come from `deploy/config.ps1` and can be overridden with the env vars `GCP_PROJECT`, `GCP_REGION`, `GCP_ZONE` and `GKE_CLUSTER`.
+
+Rough cost is about $0.30/hr for a Spot L4 (about $0.85 on-demand) plus a small CPU node. The cluster keeps billing until you run `teardown.ps1`.
+
 ### API
 
 ```bash
@@ -129,8 +160,11 @@ python scripts/load_test.py --api openai \
 | `results/vllm_docker_mixed.json` | vLLM (default), mixed 32/128/256 |
 | `results/vllm_docker_seqs8.json` | vLLM `--max-num-seqs 8`, fixed 128 |
 | `results/vllm_docker_seqs8_mixed.json` | vLLM `--max-num-seqs 8`, mixed 32/128/256 |
+| `results/gke_continuous_batch.json` / `_mixed` | Continuous fp16 1.5B on GKE L4 (100 req/level) |
+| `results/gke_vllm.json` / `_mixed` | vLLM (default) on GKE L4 (50 req/level) |
+| `results/gke_vllm_seqs8.json` / `_mixed` | vLLM `--max-num-seqs 8` on GKE L4 (50 req/level) |
 
-Rows above the Docker entries ran natively on Windows; Docker rows ran on the same GPU via WSL2.
+Rows above the Docker entries ran natively on Windows on the 4070. Docker rows ran on the same GPU via WSL2. `gke_*` rows ran on one NVIDIA L4 on GKE.
 
 **Headline findings (4070):**
 - Naive throughput stays ~flat (~0.37 req/s) while p99 climbs with concurrency.
@@ -140,3 +174,4 @@ Rows above the Docker entries ran natively on Windows; Docker rows ran on the sa
 - BnB enables **Qwen2.5-7B-Instruct** on the same 12 GB card (~5.3 GiB load, ~1.1 req/s peak) — the real quantization win.
 - In Docker, continuous holds ~2.3 req/s flat past c=8 (Windows sagged to ~1.6).
 - vLLM is ~2.3× faster at the same batch cap of 8, and reaches ~15 req/s at c=32 uncapped.
+- On a GKE L4, vLLM leads by ~3.7× at the same batch cap and ~10× uncapped (12.8 vs 1.26 req/s at c=32). Our server slowed ~2× vs the 4070 while vLLM slowed ~1.4×, which points to CPU and kernel-launch overhead as its bottleneck.
