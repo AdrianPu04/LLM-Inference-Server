@@ -101,6 +101,15 @@ python scripts/load_test.py \
   --concurrency 1 2 4 8 16 32 \
   --requests-per-level 20 \
   --out results/quantized_bnb.json
+
+# vLLM baseline (Docker, port 8001) via its OpenAI-compatible API
+docker run -d --name vllm --gpus all -p 8001:8000 --ipc=host \
+  -v hf-cache:/root/.cache/huggingface vllm/vllm-openai:latest \
+  --model Qwen/Qwen2.5-1.5B-Instruct --gpu-memory-utilization 0.75 --max-model-len 2048
+python scripts/load_test.py --api openai \
+  --url http://localhost:8001/v1/completions \
+  --concurrency 1 2 4 8 16 32 \
+  --out results/vllm_docker.json
 ```
 
 ## Results
@@ -114,6 +123,14 @@ python scripts/load_test.py \
 | `results/continuous_mixed.json` | Continuous fp16 1.5B, mixed 32/128/256 |
 | `results/quantized_bnb.json` | Continuous BnB NF4 1.5B, fixed 128 |
 | `results/quantized_bnb_7b.json` | Continuous BnB NF4 7B, fixed 128 (c≤16) |
+| `results/continuous_docker.json` | Continuous fp16 1.5B in Docker, fixed 128 |
+| `results/continuous_docker_mixed.json` | Continuous fp16 1.5B in Docker, mixed 32/128/256 |
+| `results/vllm_docker.json` | vLLM (default), fixed 128 |
+| `results/vllm_docker_mixed.json` | vLLM (default), mixed 32/128/256 |
+| `results/vllm_docker_seqs8.json` | vLLM `--max-num-seqs 8`, fixed 128 |
+| `results/vllm_docker_seqs8_mixed.json` | vLLM `--max-num-seqs 8`, mixed 32/128/256 |
+
+Rows above the Docker entries ran natively on Windows; Docker rows ran on the same GPU via WSL2.
 
 **Headline findings (4070):**
 - Naive throughput stays ~flat (~0.37 req/s) while p99 climbs with concurrency.
@@ -121,3 +138,5 @@ python scripts/load_test.py \
 - Continuous matches/beats static around moderate concurrency on uniform load, and **clearly wins on mixed lengths** (~1.8–1.9× static req/s, much lower p50).
 - BnB 4-bit on 1.5B cuts weight VRAM (~1.1 vs ~3 GiB) but is ~30% slower than fp16 continuous.
 - BnB enables **Qwen2.5-7B-Instruct** on the same 12 GB card (~5.3 GiB load, ~1.1 req/s peak) — the real quantization win.
+- In Docker, continuous holds ~2.3 req/s flat past c=8 (Windows sagged to ~1.6).
+- vLLM is ~2.3× faster at the same batch cap of 8, and reaches ~15 req/s at c=32 uncapped.

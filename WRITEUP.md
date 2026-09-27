@@ -7,11 +7,14 @@ causal LMs behind a shared FastAPI `POST /generate` API:
 2. **Static batching** — fixed batch for a whole `generate()` call  
 3. **Continuous batching** — iteration-level scheduling with in-place KV  
 4. **Quantized continuous** — same continuous scheduler with 4-bit weights (BnB NF4)
+5. **Containerized + vLLM baseline** — the servers in Docker (Linux), benchmarked
+   against vLLM on the same GPU
 
 Hardware: NVIDIA RTX 4070 (12 GB). Primary model: `Qwen/Qwen2.5-1.5B-Instruct`
 (fp16), plus BnB runs on 1.5B and `Qwen/Qwen2.5-7B-Instruct`.  
 Load test: 20 requests per concurrency level via `scripts/load_test.py`
-(typically `{1,2,4,8,16,32}`; 7B used up to 16).
+(typically `{1,2,4,8,16,32}`; 7B used up to 16). Phases 1–4 ran natively on
+Windows; Phase 5 ran in Docker (WSL2 backend) on the same card.
 
 Raw JSON: `results/`. How to run: [README.md](README.md).
 
@@ -40,8 +43,8 @@ No module named 'vllm._C_stable_libtorch'
 The installed Windows wheel lacked the native CUDA extension. vLLM is primarily
 a Linux stack; rather than sink days into WSL/driver archaeology, Phase 3 used a
 **PyTorch-native** continuous batcher. That is a deliberate engineering call, not
-a downgrade — more of the scheduler is our code. A fair vLLM baseline belongs on
-Linux/GKE later.
+a downgrade — more of the scheduler is our code. The vLLM baseline came later,
+once the project was containerized (Phase 5).
 
 ---
 
@@ -186,6 +189,82 @@ quantization unlocks a larger model, not a faster tiny one.
 
 ---
 
+## Phase 5 — Docker and the vLLM baseline
+
+One `Dockerfile` (`python:3.12-slim` + the torch cu128 wheel) serves every server,
+selected with `SERVER=<module>`. With Docker Desktop's WSL2 backend the container
+sees the 4070, which also unblocked vLLM: the official `vllm/vllm-openai` image
+runs where the Windows wheel could not. `scripts/load_test.py` gained
+`--api openai` so the same harness drives vLLM's `/v1/completions`
+(greedy, raw prompt — the same work our `/generate` does).
+
+### Linux alone helps
+
+Same fp16 continuous server, same card, uniform 128 tokens:
+
+| concurrency | Windows req/s | Docker req/s | Windows p99 | Docker p99 |
+|------------:|--------------:|-------------:|------------:|-----------:|
+| 8 | 2.04 | **2.30** | 3.53 | **2.95** |
+| 16 | 1.67 | **2.30** | 8.07 | **5.91** |
+| 32 | 1.56 | **2.29** | 12.78 | **8.74** |
+
+On Windows, throughput sagged past c=8; in the container it holds flat at the
+batch cap (~2.3 req/s, matching static's peak). Mixed-length throughput was
+about the same on both (~1.9 req/s).
+
+### vLLM vs our continuous server
+
+vLLM ran twice: default settings (up to 256 concurrent sequences) and
+`--max-num-seqs 8`, which matches our `MAX_BATCH_SIZE=8`. The capped run
+separates **per-step efficiency** from **batch size**.
+
+Uniform load (`max_new_tokens=128`):
+
+| concurrency | ours req/s | vLLM (8 seqs) req/s | vLLM (default) req/s | ours p50 | vLLM default p50 |
+|------------:|-----------:|--------------------:|---------------------:|---------:|-----------------:|
+| 1 | 0.43 | 0.92 | 0.92 | 2.30 | 1.19 |
+| 8 | 2.30 | 5.34 | 5.53 | 2.93 | 1.22 |
+| 16 | 2.30 | 5.37 | 8.21 | 5.77 | 1.26 |
+| 32 | 2.29 | 6.27 | **15.36** | 5.95 | **1.30** |
+
+Mixed load (32 / 128 / 256):
+
+| concurrency | ours req/s | vLLM (8 seqs) req/s | vLLM (default) req/s | ours p50 | vLLM default p50 |
+|------------:|-----------:|--------------------:|---------------------:|---------:|-----------------:|
+| 1 | 0.39 | 0.98 | 0.95 | 2.45 | 1.19 |
+| 8 | 1.87 | 5.77 | 5.70 | 3.16 | 1.25 |
+| 16 | 1.90 | 5.78 | 7.88 | 4.73 | 1.28 |
+| 32 | 1.89 | 6.31 | **7.95** | 4.79 | **1.29** |
+
+| Peak tok/s | ours | vLLM (8 seqs) | vLLM (default) |
+|------------|-----:|--------------:|---------------:|
+| Uniform | 295 | 728 | 1781 |
+| Mixed | 252 | 695 | 875 |
+
+Where the gap comes from:
+
+- **Per-step efficiency, about 2–3×.** At the same batch cap vLLM is still
+  2.3× faster on uniform load (5.34 vs 2.30 req/s at c=8) and about 3× on mixed.
+  Even a single request finishes in half the time. vLLM captures decode steps
+  as CUDA graphs and uses fused attention kernels. Our server runs the stock
+  HuggingFace forward pass, paying Python and kernel-launch overhead per token.
+- **Batch size, another 2.4× on top.** Uncapped, vLLM keeps scaling
+  (15.4 req/s at c=32 vs 6.3 capped) while median latency stays ~1.3 s. Its
+  paged KV cache makes large batches cheap. Our server is pinned at 8, so past
+  c=8 extra clients just queue. That's why its p50 doubles from c=8 to c=16.
+
+Caveats:
+
+- 20 requests per level is thin. At c=32 fewer than 32 requests are ever in
+  flight, and vLLM finishes a whole level in about a second, so its high-concurrency
+  rows are noisy (mixed-load default vs capped is closer than it should be for
+  this reason). The GKE runs should use more requests per level.
+- vLLM averaged ~116 completion tokens per 128-token request vs exactly 128 for
+  ours. It stops on both of Qwen's EOS tokens and applies the model's
+  `generation_config`. tok/s is the fairer comparison, and it tells the same story.
+
+---
+
 ## What I learned
 
 1. **Batching dominates locking.** Naive → static was the largest single jump.  
@@ -199,12 +278,19 @@ quantization unlocks a larger model, not a faster tiny one.
 5. **Quantization is about fit, not free speed.** On 1.5B, BnB traded ~30%
    throughput for ~⅓ the weight VRAM; on 7B, the same path made a previously
    impractical model serveable (~5.3 GiB load).
+6. **The scheduler is only half of a serving engine.** Continuous batching got
+   our server to static's throughput with better latency, but vLLM at the *same*
+   batch size is still 2–3× faster. The rest comes from the execution path
+   (CUDA graphs, fused kernels) and from a KV cache that makes big batches cheap.
 
 ---
 
 ## Next steps
 
-- **GKE / Linux:** deploy and add a real vLLM (+ optional AWQ) baseline on
-  identical hardware.  
-- Optional: latency broken out by length bucket for mixed tests; longer 7B
-  concurrency sweeps if VRAM allows.
+- **GKE:** run naive / ours / vLLM on an L4 node with more requests per level.
+- **AWQ in the container:** `autoawq` should install on Linux, giving the
+  AWQ vs BnB comparison Phase 4 skipped.
+- **Close the per-step gap:** try `TORCH_COMPILE=1` / CUDA graphs on the decode
+  step, and a larger `MAX_BATCH_SIZE`, to see how much of vLLM's lead is
+  reachable from HuggingFace code.
+- Optional: latency broken out by length bucket for mixed tests.

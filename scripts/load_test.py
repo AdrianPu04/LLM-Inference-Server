@@ -14,6 +14,10 @@ Usage:
     python load_test.py --url http://localhost:8000/generate \
         --concurrency 1 2 4 8 16 32 --max-new-tokens 32 128 256 \
         --out results/continuous_mixed.json
+
+    # vLLM / any OpenAI-compatible server (greedy, raw prompt — same work as /generate):
+    python load_test.py --api openai --url http://localhost:8001/v1/completions \
+        --model Qwen/Qwen2.5-1.5B-Instruct --out results/vllm.json
 """
 
 import argparse
@@ -34,8 +38,22 @@ PROMPTS = [
 ]
 
 
-async def single_request(client: httpx.AsyncClient, url: str, prompt: str, max_new_tokens: int):
-    payload = {"prompt": prompt, "max_new_tokens": max_new_tokens}
+def build_payload(api: str, model: str, prompt: str, max_new_tokens: int) -> dict:
+    if api == "openai":
+        return {"model": model, "prompt": prompt, "max_tokens": max_new_tokens, "temperature": 0}
+    return {"prompt": prompt, "max_new_tokens": max_new_tokens}
+
+
+def completion_tokens(api: str, data: dict) -> int:
+    if api == "openai":
+        return data.get("usage", {}).get("completion_tokens", 0)
+    return data.get("completion_tokens", 0)
+
+
+async def single_request(
+    client: httpx.AsyncClient, url: str, api: str, model: str, prompt: str, max_new_tokens: int
+):
+    payload = build_payload(api, model, prompt, max_new_tokens)
     start = time.perf_counter()
     try:
         resp = await client.post(url, json=payload, timeout=120.0)
@@ -45,20 +63,22 @@ async def single_request(client: httpx.AsyncClient, url: str, prompt: str, max_n
         return {
             "success": True,
             "wall_latency_s": wall_latency,
-            "completion_tokens": data.get("completion_tokens", 0),
+            "completion_tokens": completion_tokens(api, data),
         }
     except Exception as e:
         wall_latency = time.perf_counter() - start
         return {"success": False, "wall_latency_s": wall_latency, "error": str(e)}
 
 
-async def run_level(url: str, concurrency: int, n_requests: int, max_new_tokens: list[int]):
+async def run_level(
+    url: str, api: str, model: str, concurrency: int, n_requests: int, max_new_tokens: list[int]
+):
     async with httpx.AsyncClient() as client:
         tasks = []
         for i in range(n_requests):
             prompt = PROMPTS[i % len(PROMPTS)]
             tokens = max_new_tokens[i % len(max_new_tokens)]
-            tasks.append(single_request(client, url, prompt, tokens))
+            tasks.append(single_request(client, url, api, model, prompt, tokens))
 
         sem = asyncio.Semaphore(concurrency)
 
@@ -94,6 +114,7 @@ async def run_level(url: str, concurrency: int, n_requests: int, max_new_tokens:
         "p99_latency_s": pct(0.99),
         "mean_latency_s": statistics.mean(latencies) if latencies else None,
         "max_new_tokens": max_new_tokens,
+        "api": api,
     }
     return summary
 
@@ -101,6 +122,17 @@ async def run_level(url: str, concurrency: int, n_requests: int, max_new_tokens:
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
+    parser.add_argument(
+        "--api",
+        choices=["native", "openai"],
+        default="native",
+        help="native = this repo's POST /generate; openai = /v1/completions (vLLM etc.)",
+    )
+    parser.add_argument(
+        "--model",
+        default="Qwen/Qwen2.5-1.5B-Instruct",
+        help="Model name sent in OpenAI requests (must match the served model)",
+    )
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     parser.add_argument("--requests-per-level", type=int, default=20)
     parser.add_argument(
@@ -114,10 +146,12 @@ async def main():
     args = parser.parse_args()
 
     all_results = []
-    print(f"max_new_tokens={args.max_new_tokens}")
+    print(f"api={args.api} max_new_tokens={args.max_new_tokens}")
     print(f"{'concurrency':>12} {'req/s':>8} {'tok/s':>10} {'p50':>8} {'p90':>8} {'p99':>8} {'fail':>6}")
     for c in args.concurrency:
-        summary = await run_level(args.url, c, args.requests_per_level, args.max_new_tokens)
+        summary = await run_level(
+            args.url, args.api, args.model, c, args.requests_per_level, args.max_new_tokens
+        )
         all_results.append(summary)
         print(f"{summary['concurrency']:>12} "
               f"{summary['throughput_req_per_s']:>8.2f} "
