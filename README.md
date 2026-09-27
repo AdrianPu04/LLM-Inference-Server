@@ -160,6 +160,7 @@ python scripts/load_test.py --api openai \
 | `results/vllm_docker_mixed.json` | vLLM (default), mixed 32/128/256 |
 | `results/vllm_docker_seqs8.json` | vLLM `--max-num-seqs 8`, fixed 128 |
 | `results/vllm_docker_seqs8_mixed.json` | vLLM `--max-num-seqs 8`, mixed 32/128/256 |
+| `results/sweep_bs{8,16,32,64}.json` | Continuous in Docker, `MAX_BATCH_SIZE` sweep (c=8–64, 64–128 req/level) |
 | `results/gke_continuous_batch.json` / `_mixed` | Continuous fp16 1.5B on GKE L4 (100 req/level) |
 | `results/gke_vllm.json` / `_mixed` | vLLM (default) on GKE L4 (50 req/level) |
 | `results/gke_vllm_seqs8.json` / `_mixed` | vLLM `--max-num-seqs 8` on GKE L4 (50 req/level) |
@@ -175,3 +176,4 @@ Rows above the Docker entries ran natively on Windows on the 4070. Docker rows r
 - In Docker, continuous holds ~2.3 req/s flat past c=8 (Windows sagged to ~1.6).
 - vLLM is ~2.3× faster at the same batch cap of 8, and reaches ~15 req/s at c=32 uncapped.
 - On a GKE L4, vLLM leads by ~3.7× at the same batch cap and ~10× uncapped (12.8 vs 1.26 req/s at c=32). Our server slowed ~2× vs the 4070 while vLLM slowed ~1.4×, which points to CPU and kernel-launch overhead as its bottleneck.
+- Confirmed by a batch-size sweep: `MAX_BATCH_SIZE=32` gives 3.2× the throughput of 8 at c=32 (8.3 vs 2.6 req/s, p50 12.4s → 3.9s). At batch 64 and c=64 it reaches 12.7 req/s (1625 tok/s), close to vLLM's throughput, though latency is still ~3× higher.

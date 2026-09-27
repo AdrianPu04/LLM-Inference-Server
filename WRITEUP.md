@@ -327,6 +327,34 @@ Deploying surfaced three bugs that never appeared locally:
    setting and rejects the URI. Fixed with `enableServiceLinks: false`. A longer
    `progressDeadlineSeconds` also covers the 8.7 GB image pull.
 
+### Testing the diagnosis: batch-size sweep
+
+If a decode step is dominated by fixed per-step overhead, its cost should barely
+depend on how many sequences are in it, so raising `MAX_BATCH_SIZE` should buy
+throughput almost for free. Test setup: 4070 in Docker, uniform 128 tokens,
+64 requests per level (128 for batch 64), with no code changes.
+
+| MAX_BATCH_SIZE | c=8 req/s | c=16 req/s | c=32 req/s | c=64 req/s | p50 at c=32 |
+|---------------:|----------:|-----------:|-----------:|-----------:|------------:|
+| 8 | 2.58 | 2.64 | 2.59 | — | 12.40 |
+| 16 | 2.60 | **4.91** | 4.89 | — | 6.50 |
+| 32 | 2.58 | 4.85 | **8.33** | — | **3.87** |
+| 64 | — | — | 8.01 | **12.70** | 3.95 |
+
+Each doubling of the batch cap roughly doubles throughput once concurrency is
+high enough to fill it. Going from 8 to 32 gives 3.2× the req/s and cuts p50 at
+c=32 from 12.4 s to 3.9 s. The implied step time, p50 ÷ 128 tokens, rises from
+~24 ms at batch 8 to only ~30 ms at batch 32 and ~40 ms at batch 64. That's
+8× the work for 1.65× the time: the signature of an overhead-bound decode loop.
+Scaling starts to bend at 64 (1.5× for the last doubling) as real GPU work
+begins to count.
+
+Against vLLM on the same card (15.4 req/s, 1781 tok/s at c=32), this one
+setting closes most of the *throughput* gap. At c=64, ours reaches 1625 tok/s.
+The *latency* gap remains: vLLM's p50 is ~1.3 s vs our ~3.9 s at c=32, because
+each of our steps still costs ~3× more. That remaining gap is what static KV
+caching plus CUDA graphs would target.
+
 ---
 
 ## What I learned
@@ -349,7 +377,8 @@ Deploying surfaced three bugs that never appeared locally:
 7. **Know which resource you're bound by.** On paper the L4 predicted a ~1.4×
    slowdown, and vLLM matched it. Our server slowed 2×, which showed it was
    limited by CPU overhead, not the GPU. Moving to "better" cloud hardware
-   exposed that.
+   exposed that. A batch-size sweep confirmed it: 4× the batch cost only ~1.25×
+   per step, turning one env var into a 3.2× throughput gain.
 8. **"Works in Docker locally" isn't "works on Kubernetes."** Driver paths,
    rollout strategy with scarce GPUs, and service-link env vars each broke the
    first deploy. None of them showed up on a desktop.
@@ -360,9 +389,10 @@ Deploying surfaced three bugs that never appeared locally:
 
 - **AWQ in the container:** `autoawq` should install on Linux, giving the
   AWQ vs BnB comparison Phase 4 skipped.
-- **Close the per-step gap:** try `TORCH_COMPILE=1` / CUDA graphs on the decode
-  step, and a larger `MAX_BATCH_SIZE`, to see how much of vLLM's lead is
-  reachable from HuggingFace code. The GKE results say CPU overhead is the
-  first target.
+- **Close the per-step gap:** the batch-size sweep recovered most of the
+  throughput gap. The remaining ~3× per-step cost needs a static,
+  slot-based KV cache so the decode step has fixed shapes, then CUDA graph capture
+  per batch-size bucket. The existing `TORCH_COMPILE=1` can't help while the
+  `DynamicCache` changes shape every step.
 - **Naive and static on GKE** for a complete L4 ladder (`bench.ps1 -Server ...`).
 - Optional: latency broken out by length bucket for mixed tests.
