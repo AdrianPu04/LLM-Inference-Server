@@ -52,6 +52,22 @@ uvicorn server.quantized_server:app --host 0.0.0.0 --port 8000
 # uvicorn server.quantized_server:app --host 0.0.0.0 --port 8000
 ```
 
+### Docker
+
+One image serves every server; pick one with `SERVER` (module name under `server/`). Requires the NVIDIA driver plus NVIDIA Container Toolkit (on Windows: Docker Desktop with the WSL2 backend).
+
+```bash
+docker build -t llm-inference-server .
+
+# Continuous batching (default). The hf-cache volume keeps model downloads across runs.
+docker run --gpus all -p 8000:8000 -v hf-cache:/models llm-inference-server
+
+# Any other server / knob via env vars:
+docker run --gpus all -p 8000:8000 -v hf-cache:/models \
+  -e SERVER=quantized_server -e MODEL_NAME=Qwen/Qwen2.5-7B-Instruct \
+  llm-inference-server
+```
+
 ### API
 
 ```bash
