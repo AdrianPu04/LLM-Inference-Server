@@ -9,7 +9,8 @@ fixed shapes so it can be captured once and replayed:
     writing each new K/V at its slot's position and masking the rest
   - One CUDA graph per (batch bucket, length bucket); a step replays the
     smallest graph covering the occupied slots and longest active sequence
-  - Prefill stays eager (variable prompt length) and is copied into the slot
+  - Prefill stays eager (variable prompt length) but is batched: every waiting
+    request is prefilled in one right-padded forward, then scattered into slots
 
 Supports Llama-style decoders (Qwen2, Llama, Mistral): embed -> N x
 [norm, attn with RoPE, norm, MLP] -> norm -> lm_head.
@@ -23,6 +24,7 @@ Knobs (env):
     MAX_SEQ_LEN      default 2048
     DECODE_BURST     default 64
     CUDA_GRAPHS      default 1 (0 = run the same static decode eagerly)
+    PREFILL_TOKEN_BUDGET  default 8192 (max padded tokens per prefill forward)
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "32"))
 MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", "2048"))
 DECODE_BURST = int(os.environ.get("DECODE_BURST", "64"))
 CUDA_GRAPHS = os.environ.get("CUDA_GRAPHS", "1").strip().lower() in {"1", "true", "yes", "on"}
+PREFILL_TOKEN_BUDGET = int(os.environ.get("PREFILL_TOKEN_BUDGET", "8192"))
 
 state: dict = {}
 
@@ -78,8 +81,6 @@ class Sequence:
     generated_ids: list[int] = field(default_factory=list)
     pos: int = 0  # position of the token fed at the next decode step
     slot: int = -1
-    slot_kv: object | None = None  # prefill DynamicCache, held until copied into the slot
-    first_token: int = 0
     done: bool = False
 
 
@@ -204,13 +205,22 @@ class StaticDecoder:
         torch.cuda.synchronize()
 
     @torch.no_grad()
-    def load_slot(self, slot: int, past_key_values, prompt_len: int, next_token: int) -> None:
+    def load_slots(
+        self, slots: list[int], rows: list[int], lens: list[int], past_key_values, first_tokens: list[int]
+    ) -> None:
+        """Copy prefill KV row rows[j] (first lens[j] positions) into cache slot slots[j]."""
+        src = torch.cat([torch.full((n,), r, dtype=torch.long) for r, n in zip(rows, lens)])
+        dst = torch.cat([torch.full((n,), s, dtype=torch.long) for s, n in zip(slots, lens)])
+        pos = torch.cat([torch.arange(n) for n in lens])
+        src, dst, pos = src.to(self.device), dst.to(self.device), pos.to(self.device)
+        # One gather/scatter per layer for all admitted sequences' tokens at once.
         for i, layer in enumerate(past_key_values.layers):
-            self.k_cache[i][slot, :, :prompt_len].copy_(layer.keys[0])
-            self.v_cache[i][slot, :, :prompt_len].copy_(layer.values[0])
-        self.tokens[slot] = next_token
-        self.pos[slot] = prompt_len
-        self.active[slot] = 1
+            self.k_cache[i][dst, :, pos] = layer.keys[src, :, pos]
+            self.v_cache[i][dst, :, pos] = layer.values[src, :, pos]
+        idx = torch.tensor(slots, device=self.device)
+        self.tokens[idx] = torch.tensor(first_tokens, device=self.device)
+        self.pos[idx] = torch.tensor(lens, device=self.device)
+        self.active[idx] = 1
 
     def free_slot(self, slot: int) -> None:
         self.active[slot] = 0
@@ -228,31 +238,6 @@ class StaticDecoder:
         return out.tolist()
 
 
-def _prefill(seq: Sequence) -> None:
-    tokenizer = state["tokenizer"]
-    model = state["model"]
-
-    input_ids = tokenizer(seq.prompt, return_tensors="pt")["input_ids"].to(model.device)
-    seq.prompt_token_ids = input_ids[0].tolist()
-    if input_ids.shape[1] + seq.max_new_tokens > MAX_SEQ_LEN:
-        raise ValueError(
-            f"prompt ({input_ids.shape[1]}) + max_new_tokens ({seq.max_new_tokens}) "
-            f"exceeds MAX_SEQ_LEN ({MAX_SEQ_LEN})"
-        )
-
-    with torch.no_grad():
-        out = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), use_cache=True)
-
-    next_token = int(out.logits[0, -1].argmax(dim=-1).item())
-    seq.generated_ids = [next_token]
-    seq.pos = input_ids.shape[1]
-    if next_token == tokenizer.eos_token_id or seq.max_new_tokens <= 1:
-        seq.done = True
-        return
-    seq.slot_kv = out.past_key_values
-    seq.first_token = next_token
-
-
 class SlotBatch:
     def __init__(self, decoder: StaticDecoder):
         self.dec = decoder
@@ -265,12 +250,82 @@ class SlotBatch:
     def empty(self) -> bool:
         return all(s is None for s in self.slots)
 
-    def add(self, seq: Sequence) -> None:
-        slot = self.slots.index(None)
-        seq.slot = slot
-        self.slots[slot] = seq
-        self.dec.load_slot(slot, seq.slot_kv, seq.pos, seq.first_token)
-        seq.slot_kv = None
+    @property
+    def free(self) -> int:
+        return self.slots.count(None)
+
+    def admit(self, seqs: list[Sequence]) -> tuple[list[Sequence], list[tuple[Sequence, Exception]]]:
+        """Prefill seqs in as few forwards as the token budget allows and load them into free slots.
+
+        Returns (finished during prefill, rejected with error). Caller must not pass more than self.free.
+        """
+        tokenizer = state["tokenizer"]
+        ready, failed = [], []
+        for seq in seqs:
+            ids = tokenizer(seq.prompt)["input_ids"]
+            if len(ids) + seq.max_new_tokens > MAX_SEQ_LEN:
+                failed.append((seq, ValueError(
+                    f"prompt ({len(ids)}) + max_new_tokens ({seq.max_new_tokens}) "
+                    f"exceeds MAX_SEQ_LEN ({MAX_SEQ_LEN})"
+                )))
+                continue
+            seq.prompt_token_ids = ids
+            ready.append(seq)
+
+        finished = []
+        i = 0
+        while i < len(ready):
+            chunk, longest = [ready[i]], len(ready[i].prompt_token_ids)
+            i += 1
+            while i < len(ready):
+                cand = max(longest, len(ready[i].prompt_token_ids))
+                if (len(chunk) + 1) * cand > PREFILL_TOKEN_BUDGET:
+                    break
+                chunk.append(ready[i])
+                longest = cand
+                i += 1
+            finished += self._prefill_chunk(chunk)
+        return finished, failed
+
+    @torch.no_grad()
+    def _prefill_chunk(self, chunk: list[Sequence]) -> list[Sequence]:
+        tokenizer = state["tokenizer"]
+        model = state["model"]
+        n = len(chunk)
+        lens = [len(s.prompt_token_ids) for s in chunk]
+
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        ids = torch.full((n, max(lens)), pad_id, dtype=torch.long)
+        for r, seq in enumerate(chunk):
+            ids[r, : lens[r]] = torch.tensor(seq.prompt_token_ids)
+
+        # Right padding + causal attention: real tokens never see the pads after them, so no mask
+        # is needed and each row matches a batch-1 prefill. Pad positions' KV is never copied.
+        out = model.model(input_ids=ids.to(model.device), use_cache=True)
+        last = out.last_hidden_state[torch.arange(n), torch.tensor(lens) - 1]
+        first = model.lm_head(last).argmax(dim=-1).tolist()
+
+        finished, rows = [], []
+        for r, seq in enumerate(chunk):
+            seq.generated_ids = [first[r]]
+            seq.pos = lens[r]
+            if first[r] == tokenizer.eos_token_id or seq.max_new_tokens <= 1:
+                seq.done = True
+                finished.append(seq)
+            else:
+                rows.append(r)
+
+        if rows:
+            slots = []
+            for r in rows:
+                slot = self.slots.index(None)
+                chunk[r].slot = slot
+                self.slots[slot] = chunk[r]
+                slots.append(slot)
+            self.dec.load_slots(
+                slots, rows, [lens[r] for r in rows], out.past_key_values, [first[r] for r in rows]
+            )
+        return finished
 
     def decode_step(self) -> list[Sequence]:
         eos_id = state["tokenizer"].eos_token_id
@@ -302,18 +357,34 @@ def _gpu_worker(stop_event: threading.Event) -> None:
     incoming: queue.Queue = state["incoming"]
     batch = SlotBatch(state["decoder"])
 
-    def admit(seq: Sequence) -> None:
-        if seq.future.done():
-            return
+    def admit_waiting(first: Sequence | None = None) -> bool:
+        """Drain queued requests into free slots with one batched prefill. False means shutdown."""
+        items = [first] if first is not None else []
+        alive = True
+        while len(items) < batch.free:
+            try:
+                item = incoming.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                alive = False
+                break
+            items.append(item)
+        items = [s for s in items if not s.future.done()]
+        if not items:
+            return alive
         try:
-            _prefill(seq)
+            finished, failed = batch.admit(items)
         except Exception as exc:
-            _complete_err(seq, exc)
-            return
-        if seq.done:
+            for seq in items:
+                if seq.slot < 0:
+                    _complete_err(seq, exc)
+            raise
+        for seq in finished:
             _complete_ok(seq)
-            return
-        batch.add(seq)
+        for seq, exc in failed:
+            _complete_err(seq, exc)
+        return alive
 
     while not stop_event.is_set():
         try:
@@ -324,18 +395,12 @@ def _gpu_worker(stop_event: threading.Event) -> None:
                     continue
                 if item is None:
                     break
-                admit(item)
+                if not admit_waiting(item):
+                    stop_event.set()
                 continue
 
-            while len(batch) < MAX_BATCH_SIZE:
-                try:
-                    item = incoming.get_nowait()
-                except queue.Empty:
-                    break
-                if item is None:
-                    stop_event.set()
-                    break
-                admit(item)
+            if not admit_waiting():
+                stop_event.set()
 
             for _ in range(DECODE_BURST):
                 if batch.empty:

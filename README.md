@@ -29,7 +29,7 @@ vLLM does not import cleanly on this Windows setup (`vllm._C_stable_libtorch` mi
 | Static batch | `uvicorn server.static_batch_server:app --host 0.0.0.0 --port 8000` | Collect requests for up to 30ms / batch of 8 → one padded `generate()` |
 | Continuous batch | `uvicorn server.continuous_batch_server:app --host 0.0.0.0 --port 8000` | Iteration-level scheduling on a GPU worker thread; in-place batched KV |
 | Quantized continuous | `uvicorn server.quantized_server:app --host 0.0.0.0 --port 8000` | Same continuous scheduler with AWQ / BnB / GPTQ 4-bit weights |
-| CUDA graph | `uvicorn server.cuda_graph_server:app --host 0.0.0.0 --port 8000` | Same scheduler; static slot-based KV cache + decode step replayed as CUDA graphs (Llama-style models) |
+| CUDA graph | `uvicorn server.cuda_graph_server:app --host 0.0.0.0 --port 8000` | Same scheduler; static slot-based KV cache, decode step replayed as CUDA graphs, batched prefill per admission wave (Llama-style models) |
 
 | Knob | Default | Applies to |
 |------|---------|------------|
@@ -38,6 +38,7 @@ vLLM does not import cleanly on this Windows setup (`vllm._C_stable_libtorch` mi
 | `DECODE_BURST` | `64` | continuous, quantized |
 | `TORCH_COMPILE` | `0` | continuous, quantized |
 | `CUDA_GRAPHS` | `1` | cuda-graph (`0` runs the same static-KV decode eagerly) |
+| `PREFILL_TOKEN_BUDGET` | `8192` | cuda-graph (max padded tokens per batched prefill forward) |
 | `MAX_SEQ_LEN` | `2048` | continuous, quantized |
 | `QUANT_METHOD` | `bnb` | quantized (`bnb` \| `awq` \| `gptq`) |
 | `MODEL_NAME` | (see below) | all |
@@ -166,6 +167,7 @@ python scripts/load_test.py --api openai \
 | `results/cuda_graph_bs32.json` / `_mixed` | CUDA-graph server, batch 32, Docker (64 req/level) |
 | `results/cuda_graph_bs64.json` | CUDA-graph server, batch 64, c=32/64 (128 req/level) |
 | `results/static_eager_bs32.json` | Static KV cache without graphs (`CUDA_GRAPHS=0`), batch 32 |
+| `results/batched_prefill_bs32.json` / `_mixed`, `batched_prefill_bs64.json` | CUDA-graph server with batched prefill (current version) |
 | `results/vllm_docker_64.json` / `_mixed`, `vllm_docker_128.json` | vLLM re-run with matching request counts (64 / 128 per level) |
 | `results/gke_continuous_batch.json` / `_mixed` | Continuous fp16 1.5B on GKE L4 (100 req/level) |
 | `results/gke_vllm.json` / `_mixed` | vLLM (default) on GKE L4 (50 req/level) |
@@ -184,3 +186,4 @@ Rows above the Docker entries ran natively on Windows on the 4070. Docker rows r
 - On a GKE L4, vLLM leads by ~3.7× at the same batch cap and ~10× uncapped (12.8 vs 1.26 req/s at c=32). Our server slowed ~2× vs the 4070 while vLLM slowed ~1.4×, which points to CPU and kernel-launch overhead as its bottleneck.
 - Confirmed by a batch-size sweep: `MAX_BATCH_SIZE=32` gives 3.2× the throughput of 8 at c=32 (8.3 vs 2.6 req/s, p50 12.4s → 3.9s). At batch 64 and c=64 it reaches 12.7 req/s (1625 tok/s).
 - **Static KV cache + CUDA graphs** (`cuda_graph_server`): decode step 29 ms → 11 ms at batch 32, with token-exact output vs HF `generate()`. At c=32: 14.7 req/s (1879 tok/s, p50 2.2s) vs vLLM's 22.5 (2604 tok/s), a ~1.4× gap in tok/s, down from ~7.9× for the original server. At c=1: 1.23s vs vLLM's 1.18s.
+- **+ Batched prefill:** at c=32, 18.5 req/s (2363 tok/s, p50 1.8s). At batch 64 / c=64, 34.1 req/s (4359 tok/s) vs vLLM's 4880. That's within 4–12% of vLLM in tokens/s, and 7.1× the original continuous server at c=32.

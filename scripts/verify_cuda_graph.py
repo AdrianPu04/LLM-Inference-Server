@@ -2,8 +2,9 @@
 Check that server/cuda_graph_server.py's static-KV decode matches HF generate().
 
 Runs greedy decoding for several prompts through HF (one at a time, no padding)
-and through StaticDecoder/SlotBatch with staggered admission, mixed lengths and
-slot reuse, then compares token IDs. Tests both eager and CUDA-graph modes.
+and through StaticDecoder/SlotBatch with batched (right-padded) prefill, staggered
+admission, mixed lengths and slot reuse, then compares token IDs. Tests both
+eager and CUDA-graph modes.
 
     python scripts/verify_cuda_graph.py
 """
@@ -58,14 +59,13 @@ def run_static(decoder):
     pending = list(seqs)
 
     def admit(k):
-        for _ in range(k):
-            if pending and len(batch) < decoder.max_batch:
-                s = pending.pop(0)
-                cgs._prefill(s)
-                if not s.done:
-                    batch.add(s)
+        take = min(k, batch.free, len(pending))
+        if take:
+            group = [pending.pop(0) for _ in range(take)]
+            _, failed = batch.admit(group)  # one batched, right-padded prefill
+            assert not failed, failed
 
-    admit(2)
+    admit(3)  # different prompt lengths prefilled together
     step = 0
     while not batch.empty or pending:
         if step in (5, 20, 40):  # staggered joins; later ones land in freed slots

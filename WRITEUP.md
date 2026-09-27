@@ -9,8 +9,9 @@ causal LMs behind a shared FastAPI `POST /generate` API:
 4. **Quantized continuous** — same continuous scheduler with 4-bit weights (BnB NF4)
 5. **Containerized + vLLM baseline** — the servers in Docker, benchmarked against
    vLLM locally and on GKE (NVIDIA L4)
-6. **Static KV cache + CUDA graphs** — a fixed-shape decode step captured as CUDA
-   graphs, closing most of the gap to vLLM
+6. **Static KV cache + CUDA graphs + batched prefill** — a fixed-shape decode step
+   captured as CUDA graphs, plus one prefill per admission wave; within 4–12% of
+   vLLM in tokens/s
 
 Hardware: NVIDIA RTX 4070 (12 GB) locally; one NVIDIA L4 (24 GB, `g2-standard-8`)
 on GKE. Primary model: `Qwen/Qwen2.5-1.5B-Instruct` (fp16), plus BnB runs on 1.5B
@@ -417,22 +418,55 @@ limit, and going from 1 to 32 sequences adds only ~18%.
 | continuous, batch 8 (original) | 0.43* | 2.30* | 2.58 | 2.64 | 2.59 | 12.40 | 331 |
 | continuous, batch 32 | — | — | 2.58 | 4.85 | 8.33 | 3.87 | 1067 |
 | static KV eager, batch 32 | 0.41 | 2.41 | 3.00 | 5.68 | 9.83 | 3.30 | 1258 |
-| **static KV + CUDA graphs, batch 32** | **0.80** | **1.23** | **5.55** | **9.74** | **14.68** | **2.23** | **1879** |
+| static KV + CUDA graphs, batch 32 | 0.80 | 1.23 | 5.55 | 9.74 | 14.68 | 2.23 | 1879 |
+| **+ batched prefill, batch 32** | **0.79** | **1.25** | **5.61** | **11.38** | **18.46** | **1.80** | **2363** |
 | vLLM (default) | 0.92 | 1.18 | 6.53 | 12.47 | 22.54 | 1.38 | 2604 |
 
 \* from the 20-request Docker run.
 
-At batch 64 / c=64 the graph server reaches 21.2 req/s (2715 tok/s) vs vLLM's
-42.2 (4880). On mixed lengths (32/128/256) at c=32 it does 10.5 req/s (1439 tok/s)
-vs vLLM's 15.9 (1866).
+After CUDA graphs, vLLM's lead in tokens/s at c=32 had gone from ~7.9× (the
+original server) to ~1.4×. At c=1 the two were already level on tokens/s
+(103 vs 106). The remaining gap grew with concurrency, which pointed at prefill.
+Every new request got its own eager batch-1 prefill that stalled the whole decode
+batch (~25 ms each). At ~20 completions/s, that's a large share of GPU time.
 
-**Where that leaves the gap.** At c=32, vLLM's lead in tokens/s went from ~7.9×
-(the original server) to ~1.4×. At c=1 the two are roughly level on tokens/s
-(103 vs 106). The remaining gap grows with concurrency, which points at prefill.
-Every new request gets its own eager batch-1 prefill that stalls the whole decode
-batch (~25 ms each), and at ~20 completions/s that's a large share of GPU time.
-vLLM batches prefills and interleaves them with decode (chunked prefill), and it
-uses paged attention kernels on top.
+### Batched prefill
+
+The worker now drains every waiting request (up to the free slots) and prefills
+them in **one** forward, then copies all their KV into slots with a single
+gather/scatter per layer:
+
+- **Right padding with no attention mask.** Pads go *after* each prompt, so causal
+  attention already stops real tokens from seeing them. There's no mask to build,
+  the fast causal kernel is used, and each row computes exactly what a batch-1
+  prefill would. Pad positions' KV is never copied.
+- **`lm_head` only on each prompt's last real token.** This avoids materializing
+  `[n, L, 152k]` logits.
+- **A token budget** (`PREFILL_TOKEN_BUDGET`, default 8192 padded tokens) splits
+  very large admission waves into several forwards.
+
+Prefill at these prompt lengths is overhead-bound, like decode was. So one
+forward for *n* prompts costs about the same as one forward for 1, and each
+admission wave pays it once instead of *n* times. `verify_cuda_graph.py` now
+admits prompts of different lengths together and still matches HF exactly.
+
+| workload | before req/s (tok/s) | batched prefill req/s (tok/s) | vLLM req/s (tok/s) | gap in tok/s |
+|----------|---------------------:|------------------------------:|-------------------:|-------------:|
+| uniform, c=16, batch 32 | 9.74 (1247) | **11.38 (1457)** | 12.47 (1443) | **level** |
+| uniform, c=32, batch 32 | 14.68 (1879) | **18.46 (2363)** | 22.54 (2604) | 1.10× |
+| uniform, c=32, batch 64 | 14.66 (1876) | **19.80 (2534)** | 22.89 (2646) | 1.04× |
+| uniform, c=64, batch 64 | 21.21 (2715) | **34.05 (4359)** | 42.16 (4880) | 1.12× |
+| mixed, c=32, batch 32 | 10.50 (1439) | **12.21 (1672)** | 15.87 (1866) | 1.12× |
+
+(vLLM generates ~116 tokens per 128-token request vs our 128, as noted in
+Phase 5, so tok/s is the fair column. req/s flatters vLLM by ~10%.)
+
+**Where that leaves the gap.** The server went from 331 to 2363 tok/s at c=32:
+7.1× faster than the original continuous server, on the same GPU and model, with
+token-exact output. In tokens/s it is now within 4–12% of vLLM across these
+workloads and level at c=16. The p50 at c=32 is 1.80 s vs vLLM's 1.38 s. What's
+left is mostly that vLLM interleaves prefill chunks *with* decode steps instead
+of pausing decode for them, plus its fused/paged attention kernels.
 
 ---
 
@@ -454,7 +488,8 @@ uses paged attention kernels on top.
    batch size is still 2–4× faster. The rest comes from the execution path
    (CUDA graphs, fused kernels) and from a KV cache that makes big batches cheap.
    Phase 6 proved it: the same scheduler with a static cache and CUDA graphs ran
-   1.8× faster at c=32 and 1.9× at c=1.
+   1.8× faster at c=32 and 1.9× at c=1. Adding batched prefill brought it within
+   4–12% of vLLM in tokens/s.
 7. **Know which resource you're bound by.** On paper the L4 predicted a ~1.4×
    slowdown, and vLLM matched it. Our server slowed 2×, which showed it was
    limited by CPU overhead, not the GPU. Moving to "better" cloud hardware
@@ -477,10 +512,10 @@ uses paged attention kernels on top.
 
 - **AWQ in the container:** `autoawq` should install on Linux, giving the
   AWQ vs BnB comparison Phase 4 skipped.
-- **Batched / chunked prefill:** prefill queued requests together (padded, or
-  packed with varlen attention) and interleave them with decode steps instead of
-  stalling the batch for each one. This is the biggest remaining gap at high
-  concurrency.
+- **Chunked prefill interleaved with decode:** prefill is batched now but still
+  pauses decoding. Running prompt chunks alongside decode steps would cut the
+  remaining p50 gap (1.80 s vs 1.38 s at c=32) and matter more for long prompts,
+  where padding waste also argues for packed varlen attention.
 - **CUDA-graph server on GKE:** re-run on the L4, where the CPU-overhead penalty
   was largest (`bench.ps1 -Server cuda_graph_server`).
 - **Naive and static on GKE** for a complete L4 ladder.
