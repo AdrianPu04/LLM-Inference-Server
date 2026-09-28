@@ -4,6 +4,18 @@ HuggingFace inference servers with a shared `POST /generate` API and a load-test
 
 Design notes and benchmark discussion: [WRITEUP.md](WRITEUP.md).
 
+## Results at a glance
+
+Six serving strategies built from scratch in PyTorch (naive → static → continuous batching → 4-bit quantization → Docker/GKE → a custom engine), benchmarked against vLLM on the same GPU.
+
+![Throughput at c=32 after each optimization](docs/img/progression_c32.png)
+
+- **9.7× throughput** over the original continuous-batching server at 32 concurrent requests (331 → 3213 tok/s, RTX 4070, Qwen2.5-1.5B fp16).
+- **Faster than vLLM on short-prompt workloads:** 3213 vs 2604 tok/s at c=32, 5450 vs 4880 at c=64, median latency 1.27 s vs 1.38 s. Output is token-exact against HF `generate()`.
+- **How:** a static slot-based KV cache, decode and prefill captured as CUDA graphs, long prompts prefilled in chunks between decode steps, and a `torch.compile`d decoder layer.
+- **Where vLLM still wins:** with 1-in-8 prompts ~1,500 tokens it is ~1.5× faster, because our decode attention pads to the longest sequence (see [WRITEUP.md](WRITEUP.md#long-prompts-where-vllm-still-wins)).
+- **Deployed** in Docker and on GKE with an NVIDIA L4 (Spot, autoscaling 0–1), including scripts for setup, benchmarks and teardown.
+
 Default model: `Qwen/Qwen2.5-1.5B-Instruct` (fits a 12–16GB GPU). Override with `MODEL_NAME`.
 
 ## Setup
@@ -187,8 +199,6 @@ python scripts/load_test.py \
 | `results/gke_vllm_seqs8.json` / `_mixed` | vLLM `--max-num-seqs 8` on GKE L4 (50 req/level) |
 
 Rows above the Docker entries ran natively on Windows on the 4070. Docker rows ran on the same GPU via WSL2. `gke_*` rows ran on one NVIDIA L4 on GKE.
-
-![Throughput at c=32 after each optimization](docs/img/progression_c32.png)
 
 ![Final server vs vLLM](docs/img/vs_vllm.png)
 
