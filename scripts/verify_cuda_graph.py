@@ -2,9 +2,10 @@
 Check that server/cuda_graph_server.py's static-KV decode matches HF generate().
 
 Runs greedy decoding for several prompts through HF (one at a time, no padding)
-and through StaticDecoder/SlotBatch with batched (right-padded) prefill, staggered
-admission, mixed lengths and slot reuse, then compares token IDs. Tests both
-eager and CUDA-graph modes.
+and through StaticDecoder/SlotBatch with batched (right-padded) prefill, a long
+prompt prefilled in chunks interleaved with decode, staggered admission, mixed
+lengths and slot reuse, then compares token IDs. Tests both eager and
+CUDA-graph modes.
 
     python scripts/verify_cuda_graph.py
 """
@@ -19,9 +20,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
 import server.cuda_graph_server as cgs  # noqa: E402
 
+LONG = (
+    "A hash table stores key-value pairs in an array of buckets. A hash function maps each key "
+    "to a bucket index, so lookups, inserts and deletes take constant time on average. When two "
+    "keys land in the same bucket, the table resolves the collision either by chaining entries "
+    "in a list or by probing for another free slot. As the load factor grows, the table resizes "
+    "and rehashes every entry. Summarize this passage in two sentences."
+)
+PREFILL_CHUNK = 32  # small so LONG (~90 tokens) takes several chunks
+
 PROMPTS = [
     ("Explain the difference between a stack and a queue.", 48),
     ("Write a short story about a robot learning to paint.", 96),
+    (LONG, 40),
     ("Summarize the plot of Romeo and Juliet in three sentences.", 24),
     ("What are the main causes of the French Revolution?", 64),
     ("Describe how photosynthesis works at a high level.", 80),
@@ -61,18 +72,17 @@ def run_static(decoder):
     def admit(k):
         take = min(k, batch.free, len(pending))
         if take:
-            group = [pending.pop(0) for _ in range(take)]
-            _, failed = batch.admit(group)  # one batched, right-padded prefill
+            failed = batch.admit([pending.pop(0) for _ in range(take)])
             assert not failed, failed
 
-    admit(3)  # different prompt lengths prefilled together
+    admit(2)  # different prompt lengths prefilled together
     step = 0
     while not batch.empty or pending:
-        if step in (5, 20, 40):  # staggered joins; later ones land in freed slots
+        if step in (3, 20, 40):  # staggered joins (the long prompt at 3); later ones land in freed slots
             admit(2)
         if batch.empty:
             admit(1)
-            continue
+        batch.prefill_step()  # same order as the server: one prefill unit, then decode
         batch.decode_step()
         step += 1
     return [s.generated_ids for s in seqs]
@@ -90,7 +100,10 @@ def main():
 
     refs = [reference(model, tokenizer, p, n) for p, n in PROMPTS]
 
-    decoder = cgs.StaticDecoder(model, max_batch=4, max_len=512)
+    print(f"long prompt: {len(tokenizer(LONG)['input_ids'])} tokens, prefill chunk {PREFILL_CHUNK}")
+    decoder = cgs.StaticDecoder(model, max_batch=4, max_len=512, prefill_chunk=PREFILL_CHUNK)
+    if cgs.TORCH_COMPILE:
+        decoder.compile()
     ok = True
     for graphs in (False, True):
         cgs.CUDA_GRAPHS = graphs

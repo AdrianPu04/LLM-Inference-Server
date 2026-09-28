@@ -29,16 +29,17 @@ vLLM does not import cleanly on this Windows setup (`vllm._C_stable_libtorch` mi
 | Static batch | `uvicorn server.static_batch_server:app --host 0.0.0.0 --port 8000` | Collect requests for up to 30ms / batch of 8 → one padded `generate()` |
 | Continuous batch | `uvicorn server.continuous_batch_server:app --host 0.0.0.0 --port 8000` | Iteration-level scheduling on a GPU worker thread; in-place batched KV |
 | Quantized continuous | `uvicorn server.quantized_server:app --host 0.0.0.0 --port 8000` | Same continuous scheduler with AWQ / BnB / GPTQ 4-bit weights |
-| CUDA graph | `uvicorn server.cuda_graph_server:app --host 0.0.0.0 --port 8000` | Same scheduler; static slot-based KV cache, decode step replayed as CUDA graphs, batched prefill per admission wave (Llama-style models) |
+| CUDA graph | `uvicorn server.cuda_graph_server:app --host 0.0.0.0 --port 8000` | Same scheduler; static slot-based KV cache, decode and short-prompt prefill replayed as CUDA graphs, long prompts prefilled in chunks between decode steps, decode layer `torch.compile`d when Triton is available (Llama-style models) |
 
 | Knob | Default | Applies to |
 |------|---------|------------|
 | `MAX_BATCH_SIZE` | `32` | static, continuous, quantized, cuda-graph (results before the batch-size sweep used `8`) |
 | `BATCH_TIMEOUT_MS` | `30` | static |
 | `DECODE_BURST` | `64` | continuous, quantized |
-| `TORCH_COMPILE` | `0` | continuous, quantized |
-| `CUDA_GRAPHS` | `1` | cuda-graph (`0` runs the same static-KV decode eagerly) |
-| `PREFILL_TOKEN_BUDGET` | `8192` | cuda-graph (max padded tokens per batched prefill forward) |
+| `TORCH_COMPILE` | `0` / `auto` | continuous, quantized (`0`); cuda-graph (`auto`: on when Triton and a C compiler exist, i.e. in Docker, off on Windows) |
+| `CUDA_GRAPHS` | `1` | cuda-graph (`0` runs the same static-KV decode and prefill eagerly) |
+| `PREFILL_CHUNK` | `512` | cuda-graph (longer prompts are prefilled in chunks of this size, one decode step between chunks) |
+| `PREFILL_TOKEN_BUDGET` | `4096` | cuda-graph (max padded tokens per batched short-prompt prefill) |
 | `MAX_SEQ_LEN` | `2048` | continuous, quantized |
 | `QUANT_METHOD` | `bnb` | quantized (`bnb` \| `awq` \| `gptq`) |
 | `MODEL_NAME` | (see below) | all |
@@ -144,6 +145,14 @@ python scripts/load_test.py --api openai \
   --url http://localhost:8001/v1/completions \
   --concurrency 1 2 4 8 16 32 \
   --out results/vllm_docker.json
+
+# Long prompts: every 8th request carries a ~1500-token prompt (unique per request, so
+# prefix caching can't help); short requests' latency is reported separately
+python scripts/load_test.py \
+  --url http://localhost:8000/generate \
+  --concurrency 16 32 --requests-per-level 64 \
+  --long-prompt-every 8 --long-prompt-words 1100 \
+  --out results/long_prompts_chunk512.json
 ```
 
 ## Results
@@ -167,8 +176,12 @@ python scripts/load_test.py --api openai \
 | `results/cuda_graph_bs32.json` / `_mixed` | CUDA-graph server, batch 32, Docker (64 req/level) |
 | `results/cuda_graph_bs64.json` | CUDA-graph server, batch 64, c=32/64 (128 req/level) |
 | `results/static_eager_bs32.json` | Static KV cache without graphs (`CUDA_GRAPHS=0`), batch 32 |
-| `results/batched_prefill_bs32.json` / `_mixed`, `batched_prefill_bs64.json` | CUDA-graph server with batched prefill (current version) |
+| `results/batched_prefill_bs32.json` / `_mixed`, `batched_prefill_bs64.json` | CUDA-graph server with batched (eager, HF) prefill |
+| `results/chunked_prefill_bs32.json` / `_mixed`, `chunked_prefill_bs64.json` | + graphed short-prompt prefill and chunked long prompts, no `torch.compile` |
+| `results/compiled_bs32.json` / `_mixed`, `compiled_bs64.json` | + `torch.compile`d decode layer (current version, Docker default) |
 | `results/vllm_docker_64.json` / `_mixed`, `vllm_docker_128.json` | vLLM re-run with matching request counts (64 / 128 per level) |
+| `results/long_prompts_chunk{512,2048}.json` | Current server, every 8th prompt ~1500 tokens, chunked (512) vs whole-prompt (2048) prefill |
+| `results/vllm_docker_long_prompts.json` | vLLM on the same long-prompt workload |
 | `results/gke_continuous_batch.json` / `_mixed` | Continuous fp16 1.5B on GKE L4 (100 req/level) |
 | `results/gke_vllm.json` / `_mixed` | vLLM (default) on GKE L4 (50 req/level) |
 | `results/gke_vllm_seqs8.json` / `_mixed` | vLLM `--max-num-seqs 8` on GKE L4 (50 req/level) |
@@ -187,3 +200,5 @@ Rows above the Docker entries ran natively on Windows on the 4070. Docker rows r
 - Confirmed by a batch-size sweep: `MAX_BATCH_SIZE=32` gives 3.2× the throughput of 8 at c=32 (8.3 vs 2.6 req/s, p50 12.4s → 3.9s). At batch 64 and c=64 it reaches 12.7 req/s (1625 tok/s).
 - **Static KV cache + CUDA graphs** (`cuda_graph_server`): decode step 29 ms → 11 ms at batch 32, with token-exact output vs HF `generate()`. At c=32: 14.7 req/s (1879 tok/s, p50 2.2s) vs vLLM's 22.5 (2604 tok/s), a ~1.4× gap in tok/s, down from ~7.9× for the original server. At c=1: 1.23s vs vLLM's 1.18s.
 - **+ Batched prefill:** at c=32, 18.5 req/s (2363 tok/s, p50 1.8s). At batch 64 / c=64, 34.1 req/s (4359 tok/s) vs vLLM's 4880. That's within 4–12% of vLLM in tokens/s, and 7.1× the original continuous server at c=32.
+- **+ Graphed prefill, chunked long prompts, compiled decode layer:** short-prompt prefill 33 → 10 ms, decode step −12–16%. At c=32: 3213 tok/s (p50 1.27s) vs vLLM's 2604 (1.38s); at batch 64 / c=64: 5450 vs 4880; mixed c=32: 2180 vs 1866; c=1 p50 1.02s vs 1.18s. **Ahead of vLLM on these short-prompt workloads**, and 9.7× the original server at c=32.
+- **Long prompts are where vLLM still wins:** with every 8th prompt ~1500 tokens, vLLM does ~2110 tok/s at c=32 vs our ~1395. Chunking helps a little (vs whole-prompt prefill), but our decode attention reads every row up to the longest sequence's length, and vLLM's paged kernels don't.

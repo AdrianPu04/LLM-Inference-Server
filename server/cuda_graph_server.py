@@ -9,8 +9,13 @@ fixed shapes so it can be captured once and replayed:
     writing each new K/V at its slot's position and masking the rest
   - One CUDA graph per (batch bucket, length bucket); a step replays the
     smallest graph covering the occupied slots and longest active sequence
-  - Prefill stays eager (variable prompt length) but is batched: every waiting
-    request is prefilled in one right-padded forward, then scattered into slots
+  - Prefill also writes straight into the slots. Short prompts (<= PREFILL_CHUNK
+    tokens) are batched into one right-padded forward, graphed per
+    (rows bucket, prompt-length bucket), so admitting new requests costs a few ms
+    instead of ~30 ms of Python/kernel-launch overhead
+  - Longer prompts are prefilled PREFILL_CHUNK tokens at a time (each chunk
+    attends to the slot's cached prefix), with a decode step between chunks, so
+    running sequences keep generating while a long prompt is ingested
 
 Supports Llama-style decoders (Qwen2, Llama, Mistral): embed -> N x
 [norm, attn with RoPE, norm, MLP] -> norm -> lm_head.
@@ -23,15 +28,20 @@ Knobs (env):
     MAX_BATCH_SIZE   default 32
     MAX_SEQ_LEN      default 2048
     DECODE_BURST     default 64
-    CUDA_GRAPHS      default 1 (0 = run the same static decode eagerly)
-    PREFILL_TOKEN_BUDGET  default 8192 (max padded tokens per prefill forward)
+    CUDA_GRAPHS      default 1 (0 = run the same static decode/prefill eagerly)
+    TORCH_COMPILE    default auto (torch.compile the decode layer to fuse its elementwise ops
+                     when Triton and a C compiler are available: on in the Docker image, off on Windows)
+    PREFILL_CHUNK    default 512 (longer prompts are chunked and interleaved with decode)
+    PREFILL_TOKEN_BUDGET  default 4096 (max padded tokens per batched prefill forward)
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import queue
+import shutil
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -49,7 +59,16 @@ MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "32"))
 MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", "2048"))
 DECODE_BURST = int(os.environ.get("DECODE_BURST", "64"))
 CUDA_GRAPHS = os.environ.get("CUDA_GRAPHS", "1").strip().lower() in {"1", "true", "yes", "on"}
-PREFILL_TOKEN_BUDGET = int(os.environ.get("PREFILL_TOKEN_BUDGET", "8192"))
+def _can_compile() -> bool:
+    return importlib.util.find_spec("triton") is not None and any(
+        shutil.which(cc) for cc in ("cc", "gcc", "clang")
+    )
+
+
+_torch_compile = os.environ.get("TORCH_COMPILE", "auto").strip().lower()
+TORCH_COMPILE = _can_compile() if _torch_compile == "auto" else _torch_compile in {"1", "true", "yes", "on"}
+PREFILL_CHUNK = int(os.environ.get("PREFILL_CHUNK", "512"))
+PREFILL_TOKEN_BUDGET = int(os.environ.get("PREFILL_TOKEN_BUDGET", "4096"))
 
 state: dict = {}
 
@@ -81,6 +100,8 @@ class Sequence:
     generated_ids: list[int] = field(default_factory=list)
     pos: int = 0  # position of the token fed at the next decode step
     slot: int = -1
+    prefilled: int = 0  # prompt tokens already in the slot's KV cache
+    decoding: bool = False
     done: bool = False
 
 
@@ -113,7 +134,14 @@ def _complete_err(seq: Sequence, exc: BaseException) -> None:
 class StaticDecoder:
     """Static KV cache + fixed-shape decode step, optionally CUDA-graphed."""
 
-    def __init__(self, model, max_batch: int, max_len: int):
+    def __init__(
+        self,
+        model,
+        max_batch: int,
+        max_len: int,
+        prefill_chunk: int = PREFILL_CHUNK,
+        prefill_budget: int = PREFILL_TOKEN_BUDGET,
+    ):
         cfg = model.config
         self.model = model
         self.inner = model.model
@@ -125,8 +153,12 @@ class StaticDecoder:
         self.group = self.n_heads // self.n_kv
         self.max_batch = max_batch
         self.max_len = max_len
+        self.prefill_chunk = min(prefill_chunk, max_len)
+        self.prefill_budget = max(prefill_budget, self.prefill_chunk)
 
-        shape = (max_batch, self.n_kv, max_len, self.head_dim)
+        # One extra row past the real slots: padding rows of a graphed prefill write there.
+        self.scratch = max_batch
+        shape = (max_batch + 1, self.n_kv, max_len, self.head_dim)
         n_layers = len(self.inner.layers)
         self.k_cache = [torch.zeros(shape, dtype=self.dtype, device=self.device) for _ in range(n_layers)]
         self.v_cache = [torch.zeros(shape, dtype=self.dtype, device=self.device) for _ in range(n_layers)]
@@ -137,11 +169,51 @@ class StaticDecoder:
         self.active = torch.zeros(max_batch, dtype=torch.long, device=self.device)
         self.arange_b = torch.arange(max_batch, device=self.device)
         self.arange_l = torch.arange(max_len, device=self.device)
+        self.pf_ids = torch.zeros(max_batch, self.prefill_chunk, dtype=torch.long, device=self.device)
+        self.pf_slots = torch.full((max_batch,), self.scratch, dtype=torch.long, device=self.device)
+        self.pf_last = torch.zeros(max_batch, dtype=torch.long, device=self.device)
 
         self.batch_buckets = _buckets(max_batch, 1)
         self.len_buckets = _buckets(max_len, min(256, max_len))
+        self.prefill_len_buckets = _buckets(self.prefill_chunk, min(16, self.prefill_chunk))
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.graph_out: dict[tuple[int, int], torch.Tensor] = {}
+        self.prefill_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.prefill_out: dict[tuple[int, int], torch.Tensor] = {}
+
+
+    def _decode_layer(self, layer, k_cache, v_cache, h, cos, sin, mask, rows, pos, length: int):
+        """One decoder layer of the decode step. Kept separate so TORCH_COMPILE can compile it
+        once per shape and reuse it for every layer (parameters are inputs, not constants)."""
+        b = h.shape[0]
+        q, k, v = self._attn_inputs(layer.self_attn, layer.input_layernorm(h), cos, sin)
+
+        k_cache[rows, :, pos] = k[:, :, 0]
+        v_cache[rows, :, pos] = v[:, :, 0]
+        keys = k_cache[:b, :, :length]
+        values = v_cache[:b, :, :length]
+
+        # GQA without copying K/V: fold each KV head's query group into the query-length dim.
+        # (SDPA's enable_gqa=True with a mask falls back to a ~6x slower kernel.)
+        q = q.reshape(b, self.n_kv, self.group, self.head_dim)
+        o = F.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
+        h = h + layer.self_attn.o_proj(o.reshape(b, 1, -1))
+        return h + layer.mlp(layer.post_attention_layernorm(h))
+
+    def _attn_inputs(self, attn, x: torch.Tensor, cos, sin):
+        """q [n, heads, L, d] and k, v [n, kv_heads, L, d] for x [n, L, hidden], RoPE applied."""
+        n, length = x.shape[:2]
+        q = attn.q_proj(x).view(n, length, self.n_heads, self.head_dim).transpose(1, 2)
+        k = attn.k_proj(x).view(n, length, self.n_kv, self.head_dim).transpose(1, 2)
+        v = attn.v_proj(x).view(n, length, self.n_kv, self.head_dim).transpose(1, 2)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        return q, k, v
+
+    def prefill_fits(self, n: int, length: int) -> bool:
+        """Whether n short prompts of at most `length` tokens fit one batched prefill."""
+        if CUDA_GRAPHS:
+            n, length = _pick(self.batch_buckets, n), _pick(self.prefill_len_buckets, length)
+        return n * length <= self.prefill_budget
 
     def _step(self, b: int, length: int) -> torch.Tensor:
         """One decode token for slots [0, b), attending over cache positions [0, length)."""
@@ -155,24 +227,7 @@ class StaticDecoder:
         mask = (self.arange_l[:length].unsqueeze(0) <= pos.unsqueeze(1))[:, None, None, :]
 
         for i, layer in enumerate(self.inner.layers):
-            attn = layer.self_attn
-            x = layer.input_layernorm(h)
-            q = attn.q_proj(x).view(b, 1, self.n_heads, self.head_dim).transpose(1, 2)
-            k = attn.k_proj(x).view(b, 1, self.n_kv, self.head_dim).transpose(1, 2)
-            v = attn.v_proj(x).view(b, 1, self.n_kv, self.head_dim).transpose(1, 2)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-            self.k_cache[i][rows, :, pos] = k[:, :, 0]
-            self.v_cache[i][rows, :, pos] = v[:, :, 0]
-            keys = self.k_cache[i][:b, :, :length]
-            values = self.v_cache[i][:b, :, :length]
-
-            # GQA without copying K/V: fold each KV head's query group into the query-length dim.
-            # (SDPA's enable_gqa=True with a mask falls back to a ~6x slower kernel.)
-            q = q.reshape(b, self.n_kv, self.group, self.head_dim)
-            o = F.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
-            h = h + attn.o_proj(o.reshape(b, 1, -1))
-            h = h + layer.mlp(layer.post_attention_layernorm(h))
+            h = self._decode_layer(layer, self.k_cache[i], self.v_cache[i], h, cos, sin, mask, rows, pos, length)
 
         logits = self.model.lm_head(self.inner.norm(h))
         next_tokens = logits[:, -1, :].argmax(dim=-1)
@@ -182,22 +237,92 @@ class StaticDecoder:
         self.pos[:b].add_(self.active[:b])
         return next_tokens
 
+    def _prefill_fresh(self, n: int, length: int) -> torch.Tensor:
+        """Prefill pf_ids[:n, :length] from position 0 into slots pf_slots[:n]; next token per row.
+
+        Rows are right-padded: causal attention keeps real tokens from seeing the pads after them,
+        and the pads' K/V (past each prompt's end) is overwritten by decode before it is ever read.
+        """
+        ids = self.pf_ids[:n, :length]
+        slots = self.pf_slots[:n].unsqueeze(1)
+        positions = self.arange_l[:length]
+
+        h = self.inner.embed_tokens(ids)  # [n, length, hidden]
+        cos, sin = self.inner.rotary_emb(h, positions.unsqueeze(0))
+        for i, layer in enumerate(self.inner.layers):
+            q, k, v = self._attn_inputs(layer.self_attn, layer.input_layernorm(h), cos, sin)
+
+            self.k_cache[i][slots, :, positions] = k.transpose(1, 2)
+            self.v_cache[i][slots, :, positions] = v.transpose(1, 2)
+
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            h = h + layer.self_attn.o_proj(o.transpose(1, 2).reshape(n, length, -1))
+            h = h + layer.mlp(layer.post_attention_layernorm(h))
+
+        last = h[self.arange_b[:n], self.pf_last[:n]]
+        return self.model.lm_head(self.inner.norm(last)).argmax(dim=-1)
+
+    def _prefill_at(self, slot: int, ids: torch.Tensor, start: int) -> torch.Tensor:
+        """Prefill one chunk of a long prompt at positions [start, start + len(ids)) of `slot`."""
+        length = ids.shape[0]
+        end = start + length
+        positions = self.arange_l[start:end]
+
+        h = self.inner.embed_tokens(ids).unsqueeze(0)  # [1, length, hidden]
+        cos, sin = self.inner.rotary_emb(h, positions.unsqueeze(0))
+        # Causal over the cached prefix plus this chunk, repeated per query head in a KV group
+        # to match the folded GQA layout below.
+        mask = (self.arange_l[:end].unsqueeze(0) <= positions.unsqueeze(1)).repeat(self.group, 1)[None, None]
+        for i, layer in enumerate(self.inner.layers):
+            q, k, v = self._attn_inputs(layer.self_attn, layer.input_layernorm(h), cos, sin)
+
+            self.k_cache[i][slot, :, start:end] = k[0]
+            self.v_cache[i][slot, :, start:end] = v[0]
+            keys = self.k_cache[i][slot : slot + 1, :, :end]
+            values = self.v_cache[i][slot : slot + 1, :, :end]
+
+            q = q.reshape(1, self.n_kv, self.group * length, self.head_dim)
+            o = F.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
+            o = o.reshape(1, self.n_heads, length, self.head_dim).transpose(1, 2).reshape(1, length, -1)
+            h = h + layer.self_attn.o_proj(o)
+            h = h + layer.mlp(layer.post_attention_layernorm(h))
+
+        return self.model.lm_head(self.inner.norm(h[:, -1])).argmax(dim=-1)
+
+    def compile(self) -> None:
+        # ~1-4 s per decode shape (one compile serves all layers); capture() triggers them.
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit, 2 * len(self.batch_buckets) * len(self.len_buckets)
+        )
+        self._decode_layer = torch.compile(self._decode_layer, dynamic=False, fullgraph=True)
+
+    @staticmethod
+    def _capture_one(fn, pool):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                fn()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            out = fn()
+        return graph, out
+
     @torch.no_grad()
     def capture(self) -> None:
         pool = torch.cuda.graph_pool_handle()
         # Largest first so smaller graphs can reuse its memory from the shared pool.
+        for n in reversed(self.batch_buckets):
+            for length in reversed(self.prefill_len_buckets):
+                if n * length > self.prefill_budget:
+                    continue
+                graph, out = self._capture_one(lambda: self._prefill_fresh(n, length), pool)
+                self.prefill_graphs[(n, length)] = graph
+                self.prefill_out[(n, length)] = out
         for b in reversed(self.batch_buckets):
             for length in reversed(self.len_buckets):
-                stream = torch.cuda.Stream()
-                stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(stream):
-                    for _ in range(2):
-                        self._step(b, length)
-                torch.cuda.current_stream().wait_stream(stream)
-
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=pool):
-                    out = self._step(b, length)
+                graph, out = self._capture_one(lambda: self._step(b, length), pool)
                 self.graphs[(b, length)] = graph
                 self.graph_out[(b, length)] = out
         self.tokens.zero_()
@@ -205,18 +330,39 @@ class StaticDecoder:
         torch.cuda.synchronize()
 
     @torch.no_grad()
-    def load_slots(
-        self, slots: list[int], rows: list[int], lens: list[int], past_key_values, first_tokens: list[int]
-    ) -> None:
-        """Copy prefill KV row rows[j] (first lens[j] positions) into cache slot slots[j]."""
-        src = torch.cat([torch.full((n,), r, dtype=torch.long) for r, n in zip(rows, lens)])
-        dst = torch.cat([torch.full((n,), s, dtype=torch.long) for s, n in zip(slots, lens)])
-        pos = torch.cat([torch.arange(n) for n in lens])
-        src, dst, pos = src.to(self.device), dst.to(self.device), pos.to(self.device)
-        # One gather/scatter per layer for all admitted sequences' tokens at once.
-        for i, layer in enumerate(past_key_values.layers):
-            self.k_cache[i][dst, :, pos] = layer.keys[src, :, pos]
-            self.v_cache[i][dst, :, pos] = layer.values[src, :, pos]
+    def prefill(self, slots: list[int], prompts: list[list[int]]) -> list[int]:
+        """Batched prefill of whole short prompts into `slots`; returns each one's first new token."""
+        n, longest = len(slots), max(len(p) for p in prompts)
+        if CUDA_GRAPHS:
+            rows, length = _pick(self.batch_buckets, n), _pick(self.prefill_len_buckets, longest)
+        else:
+            rows, length = n, longest
+        ids = torch.zeros(rows, length, dtype=torch.long)
+        for r, p in enumerate(prompts):
+            ids[r, : len(p)] = torch.tensor(p)
+        pad = rows - n
+        self.pf_ids[:rows, :length].copy_(ids)
+        self.pf_slots[:rows].copy_(torch.tensor(slots + [self.scratch] * pad))
+        self.pf_last[:rows].copy_(torch.tensor([len(p) - 1 for p in prompts] + [0] * pad))
+        if CUDA_GRAPHS:
+            self.prefill_graphs[(rows, length)].replay()
+            out = self.prefill_out[(rows, length)]
+        else:
+            out = self._prefill_fresh(rows, length)
+        return out[:n].tolist()
+
+    @torch.no_grad()
+    def prefill_long(self, slot: int, ids: list[int], start: int) -> int:
+        """One chunk of a prompt longer than prefill_chunk; the token is only meaningful on the last chunk."""
+        return self._prefill_at(slot, torch.tensor(ids, device=self.device), start).item()
+
+    def reserve_slot(self, slot: int) -> None:
+        # Decode steps still run over this row while it is prefilling; park its writes at the
+        # last position, which no prompt reaches and decode overwrites before reading.
+        self.active[slot] = 0
+        self.pos[slot] = self.max_len - 1
+
+    def activate(self, slots: list[int], first_tokens: list[int], lens: list[int]) -> None:
         idx = torch.tensor(slots, device=self.device)
         self.tokens[idx] = torch.tensor(first_tokens, device=self.device)
         self.pos[idx] = torch.tensor(lens, device=self.device)
@@ -242,6 +388,7 @@ class SlotBatch:
     def __init__(self, decoder: StaticDecoder):
         self.dec = decoder
         self.slots: list[Sequence | None] = [None] * decoder.max_batch
+        self.prefilling: list[Sequence] = []  # slotted, prompt not fully in the cache yet (FIFO)
 
     def __len__(self) -> int:
         return sum(s is not None for s in self.slots)
@@ -254,13 +401,13 @@ class SlotBatch:
     def free(self) -> int:
         return self.slots.count(None)
 
-    def admit(self, seqs: list[Sequence]) -> tuple[list[Sequence], list[tuple[Sequence, Exception]]]:
-        """Prefill seqs in as few forwards as the token budget allows and load them into free slots.
+    def admit(self, seqs: list[Sequence]) -> list[tuple[Sequence, Exception]]:
+        """Tokenize seqs and reserve a slot for each; prefill_step() then fills them in.
 
-        Returns (finished during prefill, rejected with error). Caller must not pass more than self.free.
+        Returns the rejected ones with their error. Caller must not pass more than self.free.
         """
         tokenizer = state["tokenizer"]
-        ready, failed = [], []
+        failed = []
         for seq in seqs:
             ids = tokenizer(seq.prompt)["input_ids"]
             if len(ids) + seq.max_new_tokens > MAX_SEQ_LEN:
@@ -270,66 +417,66 @@ class SlotBatch:
                 )))
                 continue
             seq.prompt_token_ids = ids
-            ready.append(seq)
+            seq.slot = self.slots.index(None)
+            self.slots[seq.slot] = seq
+            self.dec.reserve_slot(seq.slot)
+            self.prefilling.append(seq)
+        return failed
 
-        finished = []
-        i = 0
-        while i < len(ready):
-            chunk, longest = [ready[i]], len(ready[i].prompt_token_ids)
-            i += 1
-            while i < len(ready):
-                cand = max(longest, len(ready[i].prompt_token_ids))
-                if (len(chunk) + 1) * cand > PREFILL_TOKEN_BUDGET:
-                    break
-                chunk.append(ready[i])
-                longest = cand
-                i += 1
-            finished += self._prefill_chunk(chunk)
-        return finished, failed
+    def prefill_step(self) -> list[Sequence]:
+        """Run one prefill forward: either a batch of whole short prompts or one chunk of a long one.
 
-    @torch.no_grad()
-    def _prefill_chunk(self, chunk: list[Sequence]) -> list[Sequence]:
-        tokenizer = state["tokenizer"]
-        model = state["model"]
-        n = len(chunk)
-        lens = [len(s.prompt_token_ids) for s in chunk]
+        Returns sequences that finished on their first token (EOS or max_new_tokens <= 1).
+        """
+        if not self.prefilling:
+            return []
+        chunk = self.dec.prefill_chunk
+        head = self.prefilling[0]
+        if len(head.prompt_token_ids) > chunk:
+            start = head.prefilled
+            ids = head.prompt_token_ids[start : start + chunk]
+            first = self.dec.prefill_long(head.slot, ids, start)
+            head.prefilled += len(ids)
+            if head.prefilled < len(head.prompt_token_ids):
+                return []
+            self.prefilling.pop(0)
+            return self._start_decoding([head], [first])
 
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        ids = torch.full((n, max(lens)), pad_id, dtype=torch.long)
-        for r, seq in enumerate(chunk):
-            ids[r, : lens[r]] = torch.tensor(seq.prompt_token_ids)
+        group, longest = [], 0
+        for seq in self.prefilling:
+            n = len(seq.prompt_token_ids)
+            if n > chunk or not self.dec.prefill_fits(len(group) + 1, max(longest, n)):
+                break
+            group.append(seq)
+            longest = max(longest, n)
+        del self.prefilling[: len(group)]
+        first = self.dec.prefill([s.slot for s in group], [s.prompt_token_ids for s in group])
+        return self._start_decoding(group, first)
 
-        # Right padding + causal attention: real tokens never see the pads after them, so no mask
-        # is needed and each row matches a batch-1 prefill. Pad positions' KV is never copied.
-        out = model.model(input_ids=ids.to(model.device), use_cache=True)
-        last = out.last_hidden_state[torch.arange(n), torch.tensor(lens) - 1]
-        first = model.lm_head(last).argmax(dim=-1).tolist()
-
-        finished, rows = [], []
-        for r, seq in enumerate(chunk):
-            seq.generated_ids = [first[r]]
-            seq.pos = lens[r]
-            if first[r] == tokenizer.eos_token_id or seq.max_new_tokens <= 1:
+    def _start_decoding(self, seqs: list[Sequence], first: list[int]) -> list[Sequence]:
+        eos_id = state["tokenizer"].eos_token_id
+        finished, go = [], []
+        for seq, tok in zip(seqs, first):
+            seq.prefilled = len(seq.prompt_token_ids)
+            seq.generated_ids = [tok]
+            seq.pos = seq.prefilled
+            if tok == eos_id or seq.max_new_tokens <= 1:
                 seq.done = True
                 finished.append(seq)
+                self.slots[seq.slot] = None
+                self.dec.free_slot(seq.slot)
             else:
-                rows.append(r)
-
-        if rows:
-            slots = []
-            for r in rows:
-                slot = self.slots.index(None)
-                chunk[r].slot = slot
-                self.slots[slot] = chunk[r]
-                slots.append(slot)
-            self.dec.load_slots(
-                slots, rows, [lens[r] for r in rows], out.past_key_values, [first[r] for r in rows]
-            )
+                seq.decoding = True
+                go.append(seq)
+        if go:
+            self.dec.activate([s.slot for s in go], [s.generated_ids[0] for s in go], [s.pos for s in go])
         return finished
 
     def decode_step(self) -> list[Sequence]:
+        live = [s for s in self.slots if s is not None and s.decoding]
+        if not live:
+            return []
         eos_id = state["tokenizer"].eos_token_id
-        live = [s for s in self.slots if s is not None]
         b_need = max(s.slot for s in live) + 1
         len_need = max(s.pos for s in live) + 1
         next_tokens = self.dec.decode(b_need, len_need)
@@ -346,6 +493,7 @@ class SlotBatch:
         return finished
 
     def fail_all(self, exc: BaseException) -> None:
+        self.prefilling.clear()
         for i, seq in enumerate(self.slots):
             if seq is not None:
                 _complete_err(seq, exc)
@@ -358,7 +506,7 @@ def _gpu_worker(stop_event: threading.Event) -> None:
     batch = SlotBatch(state["decoder"])
 
     def admit_waiting(first: Sequence | None = None) -> bool:
-        """Drain queued requests into free slots with one batched prefill. False means shutdown."""
+        """Drain queued requests into free slots (prefill happens in the loop). False means shutdown."""
         items = [first] if first is not None else []
         alive = True
         while len(items) < batch.free:
@@ -374,14 +522,12 @@ def _gpu_worker(stop_event: threading.Event) -> None:
         if not items:
             return alive
         try:
-            finished, failed = batch.admit(items)
+            failed = batch.admit(items)
         except Exception as exc:
             for seq in items:
                 if seq.slot < 0:
                     _complete_err(seq, exc)
             raise
-        for seq in finished:
-            _complete_ok(seq)
         for seq, exc in failed:
             _complete_err(seq, exc)
         return alive
@@ -402,12 +548,21 @@ def _gpu_worker(stop_event: threading.Event) -> None:
             if not admit_waiting():
                 stop_event.set()
 
+            for seq in batch.prefill_step():
+                _complete_ok(seq)
+            if batch.prefilling:
+                # More prefill queued (a long prompt's next chunk, or over budget): give running
+                # sequences one token, then come back, instead of stalling them for all of it.
+                for seq in batch.decode_step():
+                    _complete_ok(seq)
+                continue
+
             for _ in range(DECODE_BURST):
                 if batch.empty:
                     break
                 for seq in batch.decode_step():
                     _complete_ok(seq)
-                if not incoming.empty() and len(batch) < MAX_BATCH_SIZE:
+                if not incoming.empty() and batch.free:
                     break
         except Exception as exc:
             print(f"[gpu_worker] error: {exc!r}")
@@ -427,12 +582,15 @@ async def lifespan(app: FastAPI):
     model.eval()
 
     decoder = StaticDecoder(model, MAX_BATCH_SIZE, MAX_SEQ_LEN)
+    if TORCH_COMPILE:
+        decoder.compile()
     if CUDA_GRAPHS:
         t0 = time.perf_counter()
         decoder.capture()
         print(
-            f"Captured {len(decoder.graphs)} CUDA graphs in {time.perf_counter() - t0:.1f}s "
-            f"(batch {decoder.batch_buckets} x len {decoder.len_buckets})"
+            f"Captured {len(decoder.graphs)} decode + {len(decoder.prefill_graphs)} prefill CUDA graphs "
+            f"in {time.perf_counter() - t0:.1f}s (batch {decoder.batch_buckets} x len {decoder.len_buckets}; "
+            f"prefill len {decoder.prefill_len_buckets}, <= {decoder.prefill_budget} tokens)"
         )
 
     state["tokenizer"] = tokenizer
@@ -499,5 +657,8 @@ async def health():
         "scheduler": "static_kv_cuda_graph" if CUDA_GRAPHS else "static_kv_eager",
         "decode_burst": DECODE_BURST,
         "cuda_graphs": CUDA_GRAPHS,
+        "torch_compile": TORCH_COMPILE,
         "graph_count": len(decoder.graphs) if decoder else 0,
+        "prefill_graph_count": len(decoder.prefill_graphs) if decoder else 0,
+        "prefill_chunk": decoder.prefill_chunk if decoder else PREFILL_CHUNK,
     }

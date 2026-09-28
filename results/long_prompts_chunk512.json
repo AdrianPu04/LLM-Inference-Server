@@ -1,0 +1,71 @@
+[
+  {
+    "concurrency": 16,
+    "n_requests": 64,
+    "n_success": 64,
+    "n_failure": 0,
+    "wall_time_s": 7.835356799998408,
+    "throughput_req_per_s": 8.16810282334724,
+    "throughput_tokens_per_s": 1045.5171613884468,
+    "p50_latency_s": 1.8479464000010921,
+    "p90_latency_s": 2.2457078999996156,
+    "p99_latency_s": 2.3021781999996165,
+    "mean_latency_s": 1.9234559921875132,
+    "max_new_tokens": [
+      128
+    ],
+    "api": "native",
+    "long_prompt_every": 8,
+    "long_prompt_words": 1100,
+    "short_p50_latency_s": 1.8438562999999704,
+    "short_p90_latency_s": 2.300342599999567,
+    "short_p99_latency_s": 2.3021781999996165,
+    "long_p50_latency_s": 1.9248578000006091
+  },
+  {
+    "concurrency": 32,
+    "n_requests": 64,
+    "n_success": 64,
+    "n_failure": 0,
+    "wall_time_s": 5.8640076000010595,
+    "throughput_req_per_s": 10.914037696674956,
+    "throughput_tokens_per_s": 1396.9968251743944,
+    "p50_latency_s": 2.8171497999992425,
+    "p90_latency_s": 3.2566788000003726,
+    "p99_latency_s": 3.4851417999998375,
+    "mean_latency_s": 2.8519526609374566,
+    "max_new_tokens": [
+      128
+    ],
+    "api": "native",
+    "long_prompt_every": 8,
+    "long_prompt_words": 1100,
+    "short_p50_latency_s": 2.8171497999992425,
+    "short_p90_latency_s": 3.2566788000003726,
+    "short_p99_latency_s": 3.4851417999998375,
+    "long_p50_latency_s": 2.836391699998785
+  },
+  {
+    "concurrency": 32,
+    "n_requests": 64,
+    "n_success": 64,
+    "n_failure": 0,
+    "wall_time_s": 5.877263700000185,
+    "throughput_req_per_s": 10.889421211438579,
+    "throughput_tokens_per_s": 1393.8459150641381,
+    "p50_latency_s": 2.8168144000010216,
+    "p90_latency_s": 3.31185319999895,
+    "p99_latency_s": 3.5062534999997297,
+    "mean_latency_s": 2.8627252609374807,
+    "max_new_tokens": [
+      128
+    ],
+    "api": "native",
+    "long_prompt_every": 8,
+    "long_prompt_words": 1100,
+    "short_p50_latency_s": 2.8158160999992106,
+    "short_p90_latency_s": 3.31185319999895,
+    "short_p99_latency_s": 3.313232700000299,
+    "long_p50_latency_s": 2.883445399998891
+  }
+]

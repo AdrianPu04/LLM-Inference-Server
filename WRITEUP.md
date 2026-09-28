@@ -9,9 +9,10 @@ causal LMs behind a shared FastAPI `POST /generate` API:
 4. **Quantized continuous** — same continuous scheduler with 4-bit weights (BnB NF4)
 5. **Containerized + vLLM baseline** — the servers in Docker, benchmarked against
    vLLM locally and on GKE (NVIDIA L4)
-6. **Static KV cache + CUDA graphs + batched prefill** — a fixed-shape decode step
-   captured as CUDA graphs, plus one prefill per admission wave; within 4–12% of
-   vLLM in tokens/s
+6. **Static KV cache + CUDA graphs + batched/chunked prefill + `torch.compile`** —
+   fixed-shape decode and prefill captured as CUDA graphs, long prompts chunked
+   between decode steps, the decode layer compiled; ahead of vLLM in tokens/s on
+   short-prompt workloads, behind it (~1.5×) when long prompts are mixed in
 
 Hardware: NVIDIA RTX 4070 (12 GB) locally; one NVIDIA L4 (24 GB, `g2-standard-8`)
 on GKE. Primary model: `Qwen/Qwen2.5-1.5B-Instruct` (fp16), plus BnB runs on 1.5B
@@ -365,7 +366,7 @@ more. Phase 6 goes after that.
 `server/cuda_graph_server.py` keeps the same scheduler and API but replaces the
 decode step.
 
-**Why `TORCH_COMPILE=1` couldn't do this.** A CUDA graph replays a recorded
+**Why the continuous server's `TORCH_COMPILE=1` couldn't do this.** A CUDA graph replays a recorded
 sequence of kernels on fixed tensor shapes and addresses. The continuous server's
 `DynamicCache` grows every step and is rebuilt whenever a sequence joins or
 leaves, so there's nothing stable to capture.
@@ -386,8 +387,8 @@ leaves, so there's nothing stable to capture.
    for batch `{1..32}` × length `{256..2048}`, captured in ~3 s at startup and
    sharing one memory pool. Each step replays the smallest graph that covers the
    occupied slots and the longest active sequence.
-4. **Prefill stays eager**, since prompt lengths vary. Its KV is copied into the
-   slot.
+4. **Prefill stays eager** at first, since prompt lengths vary. Its KV is copied
+   into the slot. (Later sections batch it, then graph it too.)
 
 **Correctness:** `scripts/verify_cuda_graph.py` compares token IDs against HF
 `generate()` (greedy) with staggered admission and slot reuse. All six prompts
@@ -461,12 +462,115 @@ admits prompts of different lengths together and still matches HF exactly.
 (vLLM generates ~116 tokens per 128-token request vs our 128, as noted in
 Phase 5, so tok/s is the fair column. req/s flatters vLLM by ~10%.)
 
-**Where that leaves the gap.** The server went from 331 to 2363 tok/s at c=32:
-7.1× faster than the original continuous server, on the same GPU and model, with
-token-exact output. In tokens/s it is now within 4–12% of vLLM across these
-workloads and level at c=16. The p50 at c=32 is 1.80 s vs vLLM's 1.38 s. What's
-left is mostly that vLLM interleaves prefill chunks *with* decode steps instead
-of pausing decode for them, plus its fused/paged attention kernels.
+At this point the server went from 331 to 2363 tok/s at c=32 (7.1× the original)
+and sat within 4–12% of vLLM in tokens/s, with a p50 of 1.80 s vs 1.38 s. Two
+things were left: prefill still paused decode, and each step still had overhead
+above the weight-streaming floor.
+
+### Graphed prefill and chunked long prompts
+
+Timing prefill on its own showed it had the same problem decode had before
+graphs. An HF forward over 14-token prompts cost **~33 ms whether it had 1 row or
+32**, against ~6 ms to stream the weights; the rest was Python and kernel
+launches. Long prompts were the opposite: 4 × 512 tokens took 171 ms of real
+compute, and decode stood still for all of it.
+
+So prefill moved off HF and onto the static cache too:
+
+- **Prefill writes straight into the slots.** A second hand-written forward
+  (same modules as decode) scatters each prompt's K/V into its slot as it goes,
+  so the gather/copy from a `DynamicCache` disappears.
+- **Short prompts (≤ `PREFILL_CHUNK`, default 512 tokens) are graphed.** One
+  graph per (rows bucket × prompt-length bucket `{16..512}`), capped at
+  `PREFILL_TOKEN_BUDGET` = 4096 padded tokens: 33 graphs. Padding rows write to a
+  spare scratch row in the cache. Admitting a wave now costs **10–12 ms instead
+  of 33** at 1–4 rows, and 35 ms at 32 rows, where it's compute-bound anyway.
+  Measured eager at every size, the graph was never slower.
+- **Long prompts are chunked.** A prompt over 512 tokens gets its slot at
+  admission and is prefilled 512 tokens per scheduler iteration; each chunk
+  attends to the slot's cached prefix plus itself (the same GQA folding, with a
+  causal mask). **Between chunks the running sequences take a decode step**, so
+  a 1,500-token prompt no longer freezes everyone for its whole prefill. While
+  prefilling, the slot is parked: inactive, with its decode writes aimed at the
+  last cache position, which no prompt reaches.
+
+`verify_cuda_graph.py` gained a 92-token prompt prefilled in 32-token chunks,
+admitted while others decode. All seven prompts still match HF exactly.
+
+### Compiling the decode layer
+
+With both halves graphed, the batch-1 step was still 9.5 ms against the ~6 ms
+weight floor. The profile showed why: ~1,100 small kernels per step (RMSNorm's
+cast/pow/mean/rsqrt/mul, RoPE, SiLU·mul, residual adds), each only a few µs but
+serialized. That's what vLLM's fused kernels and `torch.compile` address.
+
+- **Compiling the whole step** fused them: **−11–16%** per step, token-identical,
+  but 18 s of compile per shape, so ~7 min for 24 buckets.
+- **Compiling one decoder layer** gets the same speedup. Dynamo treats module
+  parameters as inputs, so one compiled graph serves all 28 layers, and a shape
+  compiles in 1–4 s. The graphs are then captured around the compiled layer as
+  before. Startup is ~35 s total, and the Inductor cache lives on the model volume.
+- `TORCH_COMPILE=auto` turns it on when Triton and a C compiler exist. The Docker
+  image adds `gcc` for Triton's launcher; Windows has no Triton, so it stays off
+  there.
+
+Graphed decode step, batch 32 / 64 at length 256: 10.95 → **9.20 ms** and
+12.10 → **10.61 ms**.
+
+**Tried and dropped:**
+- *Fusing q/k/v and gate/up into single GEMMs* (weights re-pointed as views, so
+  no extra memory). It was slower at every batch size (10.45 → 11.40 ms at 32);
+  cuBLAS picked worse kernels for the wider matrices.
+- *Dynamic-shape compile* (one compile for all buckets). It still took 112 s,
+  and its kernels were slower than not compiling at all.
+- *FlexAttention* with a per-row block mask, to skip KV past each row's length.
+  It was correct but slower in every case, even with 28 of 32 rows short
+  (18.9 vs 16.8 ms).
+
+### End to end, current version (4070, Docker)
+
+| workload | batched prefill tok/s | + graphed/chunked prefill | + compiled layer | vLLM tok/s | ours vs vLLM |
+|----------|---------------------:|--------------------------:|-----------------:|-----------:|-------------:|
+| uniform, c=1 (p50) | 1.25 s | 1.15 s | **1.02 s** | 1.18 s | faster |
+| uniform, c=16, batch 32 | 1457 | 1607 | **1841** | 1443 | 1.28× |
+| uniform, c=32, batch 32 | 2363 | 2758 | **3213** | 2604 | 1.23× |
+| uniform, c=32 p50 | 1.80 s | 1.54 s | **1.27 s** | 1.38 s | faster |
+| uniform, c=64, batch 64 | 4359 | 4375 | **5450** | 4880 | 1.12× |
+| mixed, c=32, batch 32 | 1672 | 1928 | **2180** | 1866 | 1.17× |
+
+Caveats: run-to-run noise is about ±8%, and the first level after a restart is
+consistently slower. vLLM also generates ~116 tokens per request to our 128, so
+its per-request latency is doing ~10% less work. Even so, on these short-prompt
+workloads the server now **matches or beats vLLM** on the same GPU, and is
+9.7× the original continuous server at c=32.
+
+### Long prompts: where vLLM still wins
+
+Every benchmark above uses ~12-token prompts. `load_test.py --long-prompt-every 8`
+makes every 8th request a ~1,500-token prompt, with a random nonce at the start
+so no prefix cache can reuse it. (The first version reused prompts across levels,
+and vLLM's prefix cache, on by default, quietly served the second level from
+cache.) Results at c=32, batch 32, 64 requests:
+
+| server | req/s | tok/s | short-request p50 | short p90 |
+|--------|------:|------:|------------------:|----------:|
+| ours, whole-prompt prefill (`PREFILL_CHUNK=2048`) | 10.4–10.6 | 1335–1360 | 2.95–3.12 s | 3.3–3.8 s |
+| ours, chunked (`PREFILL_CHUNK=512`) | **10.9** | **1395** | **2.82 s** | **3.3 s** |
+| vLLM | 18.2 | 2110 | 1.75 s | 1.8 s |
+
+Chunking helps, but modestly: 3–5% throughput and a few percent of short-request
+latency. vLLM is ~1.5× ahead here, and the accounting says why. The extra wall
+time over the short-prompt run is ~3.3 s per 64 requests:
+
+- **~1 s is prefill compute** (8 prompts × ~125 ms, GEMM-bound). vLLM pays about
+  the same.
+- **~1.4 s is decode attention.** Our step attends every row up to the length
+  bucket of the *longest* sequence. One 1,600-token request pushes all 32 rows to
+  the 2,048 bucket, and the step goes 11 → 15.8 ms. vLLM's paged attention reads
+  only each row's real length.
+- The rest comes from alternating instead of mixing. vLLM runs prefill chunks and
+  decode tokens *in the same forward* (the decode tokens ride along nearly free
+  on a compute-bound GEMM); we alternate a chunk with a decode step.
 
 ---
 
@@ -488,8 +592,8 @@ of pausing decode for them, plus its fused/paged attention kernels.
    batch size is still 2–4× faster. The rest comes from the execution path
    (CUDA graphs, fused kernels) and from a KV cache that makes big batches cheap.
    Phase 6 proved it: the same scheduler with a static cache and CUDA graphs ran
-   1.8× faster at c=32 and 1.9× at c=1. Adding batched prefill brought it within
-   4–12% of vLLM in tokens/s.
+   1.8× faster at c=32 and 1.9× at c=1. Batched, then graphed and chunked
+   prefill plus a compiled decode layer took it past vLLM on short prompts.
 7. **Know which resource you're bound by.** On paper the L4 predicted a ~1.4×
    slowdown, and vLLM matched it. Our server slowed 2×, which showed it was
    limited by CPU overhead, not the GPU. Moving to "better" cloud hardware
@@ -504,7 +608,18 @@ of pausing decode for them, plus its fused/paged attention kernels.
    reshape fixed it.
 10. **Benchmark the baseline as carefully as your own code.** vLLM's 20-request
     runs undercounted it by ~1.5×. Re-running with matched request counts
-    reversed a "close to vLLM" conclusion.
+    reversed a "close to vLLM" conclusion. Later, repeated long prompts let
+    vLLM's prefix cache hide their cost until each prompt got a unique nonce.
+11. **Overhead hides in every phase.** Graphing decode exposed prefill as the
+    next launch-bound piece (33 ms for 1 row or 32). Graphing that exposed ~1,100
+    tiny elementwise kernels per step. Each fix made the next bottleneck visible.
+12. **Not every "standard" optimization wins on your shapes.** Fused QKV/gate-up
+    GEMMs, dynamic-shape compile and FlexAttention are all things real engines
+    use. Here each was measured slower and dropped. Compiling one layer instead
+    of the whole step got the same speedup at 1/20 of the compile time.
+13. **Your benchmark decides your conclusion.** Short prompts say "faster than
+    vLLM"; one long prompt in eight says "1.5× slower". Both are true, and the
+    second points at the next piece of work (per-row-length attention).
 
 ---
 
@@ -512,10 +627,13 @@ of pausing decode for them, plus its fused/paged attention kernels.
 
 - **AWQ in the container:** `autoawq` should install on Linux, giving the
   AWQ vs BnB comparison Phase 4 skipped.
-- **Chunked prefill interleaved with decode:** prefill is batched now but still
-  pauses decoding. Running prompt chunks alongside decode steps would cut the
-  remaining p50 gap (1.80 s vs 1.38 s at c=32) and matter more for long prompts,
-  where padding waste also argues for packed varlen attention.
+- **Per-row-length decode attention** for long-prompt mixes: a kernel that reads
+  only each slot's real KV length, such as FlashAttention's
+  `flash_attn_with_kvcache(cache_seqlens=...)`, FlashInfer, or paged attention.
+  This is the largest piece of the remaining ~1.5× long-prompt gap. FlexAttention
+  was tried and was slower.
+- **Mixed prefill + decode forwards:** run a long prompt's chunk and the decode
+  tokens through the same GEMMs instead of alternating them.
 - **CUDA-graph server on GKE:** re-run on the L4, where the CPU-overhead penalty
   was largest (`bench.ps1 -Server cuda_graph_server`).
 - **Naive and static on GKE** for a complete L4 ladder.

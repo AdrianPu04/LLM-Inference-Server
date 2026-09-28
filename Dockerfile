@@ -14,6 +14,12 @@ RUN pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
+# Triton (bundled with torch) compiles a small C launcher, so torch.compile needs a C compiler.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+# Compiled kernels are cached on the model volume so restarts skip recompiling.
+ENV TORCHINDUCTOR_CACHE_DIR=/models/torchinductor
+
 COPY server/ server/
 COPY scripts/ scripts/
 
