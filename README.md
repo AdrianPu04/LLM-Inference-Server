@@ -188,6 +188,12 @@ python scripts/load_test.py \
 
 Rows above the Docker entries ran natively on Windows on the 4070. Docker rows ran on the same GPU via WSL2. `gke_*` rows ran on one NVIDIA L4 on GKE.
 
+![Throughput at c=32 after each optimization](docs/img/progression_c32.png)
+
+![Final server vs vLLM](docs/img/vs_vllm.png)
+
+Charts are generated from `results/` by `python scripts/plot_results.py` (needs `pip install matplotlib`); all of them are in `docs/img/` and embedded in [WRITEUP.md](WRITEUP.md).
+
 **Headline findings (4070):**
 - Naive throughput stays ~flat (~0.37 req/s) while p99 climbs with concurrency.
 - Static batching raises peak throughput to ~2.3 req/s on uniform 1.5B fp16.
@@ -196,7 +202,7 @@ Rows above the Docker entries ran natively on Windows on the 4070. Docker rows r
 - BnB enables **Qwen2.5-7B-Instruct** on the same 12 GB card (~5.3 GiB load, ~1.1 req/s peak) — the real quantization win.
 - In Docker, continuous holds ~2.3 req/s flat past c=8 (Windows sagged to ~1.6).
 - vLLM is ~2.3× faster at the same batch cap of 8, and reaches ~15 req/s at c=32 uncapped.
-- On a GKE L4, vLLM leads by ~3.7× at the same batch cap and ~10× uncapped (12.8 vs 1.26 req/s at c=32). Our server slowed ~2× vs the 4070 while vLLM slowed ~1.4×, which points to CPU and kernel-launch overhead as its bottleneck.
+- On a GKE L4 (original continuous server; the Phase 6 server wasn't redeployed), vLLM leads by ~3.7× at the same batch cap and ~10× uncapped (12.8 vs 1.26 req/s at c=32). Our server slowed ~2× vs the 4070 while vLLM slowed ~1.4×, which points to CPU and kernel-launch overhead as its bottleneck.
 - Confirmed by a batch-size sweep: `MAX_BATCH_SIZE=32` gives 3.2× the throughput of 8 at c=32 (8.3 vs 2.6 req/s, p50 12.4s → 3.9s). At batch 64 and c=64 it reaches 12.7 req/s (1625 tok/s).
 - **Static KV cache + CUDA graphs** (`cuda_graph_server`): decode step 29 ms → 11 ms at batch 32, with token-exact output vs HF `generate()`. At c=32: 14.7 req/s (1879 tok/s, p50 2.2s) vs vLLM's 22.5 (2604 tok/s), a ~1.4× gap in tok/s, down from ~7.9× for the original server. At c=1: 1.23s vs vLLM's 1.18s.
 - **+ Batched prefill:** at c=32, 18.5 req/s (2363 tok/s, p50 1.8s). At batch 64 / c=64, 34.1 req/s (4359 tok/s) vs vLLM's 4880. That's within 4–12% of vLLM in tokens/s, and 7.1× the original continuous server at c=32.

@@ -121,6 +121,8 @@ the in-place cache + worker thread closed that gap.
 On uniform traffic, continuous is competitive and even leads around concurrency 8;
 static’s fused `generate()` still edges peak throughput at 16–32.
 
+![Phases 1–3: throughput and p99 latency vs concurrency](docs/img/phases_1_3.png)
+
 ### Mixed load (`max_new_tokens` cycling 32 / 128 / 256)
 
 This is where iteration-level scheduling should win.
@@ -271,6 +273,11 @@ Caveats:
 
 ### GKE: the same comparison on an NVIDIA L4
 
+> **These GKE numbers predate Phase 6.** "Ours" here is the original continuous
+> server at batch 8. The CUDA-graph server wasn't redeployed to GKE (the
+> cluster was torn down to save credits), so its results are 4070-only. The
+> overhead this section diagnoses is exactly what Phase 6 removed.
+
 `deploy/` stands up a zonal GKE cluster with a Spot `g2-standard-8` + L4 pool that
 scales 0–1, and pushes the image to Artifact Registry. `bench.ps1` deploys one
 server at a time and runs the load test from a pod inside the cluster, so no
@@ -299,6 +306,8 @@ Mixed load (32 / 128 / 256):
 |------------|-----:|--------------:|---------------:|
 | Uniform | 162 | 537 | 1484 |
 | Mixed | 156 | 516 | 1210 |
+
+![GKE L4: original continuous server vs vLLM](docs/img/gke_l4.png)
 
 With more requests per level, the curves are much cleaner than the local runs:
 
@@ -538,6 +547,10 @@ Graphed decode step, batch 32 / 64 at length 256: 10.95 → **9.20 ms** and
 | uniform, c=64, batch 64 | 4359 | 4375 | **5450** | 4880 | 1.12× |
 | mixed, c=32, batch 32 | 1672 | 1928 | **2180** | 1866 | 1.17× |
 
+![Throughput at c=32 after each optimization](docs/img/progression_c32.png)
+
+![Final server vs vLLM: throughput and median latency vs concurrency](docs/img/vs_vllm.png)
+
 Caveats: run-to-run noise is about ±8%, and the first level after a restart is
 consistently slower. vLLM also generates ~116 tokens per request to our 128, so
 its per-request latency is doing ~10% less work. Even so, on these short-prompt
@@ -557,6 +570,8 @@ cache.) Results at c=32, batch 32, 64 requests:
 | ours, whole-prompt prefill (`PREFILL_CHUNK=2048`) | 10.4–10.6 | 1335–1360 | 2.95–3.12 s | 3.3–3.8 s |
 | ours, chunked (`PREFILL_CHUNK=512`) | **10.9** | **1395** | **2.82 s** | **3.3 s** |
 | vLLM | 18.2 | 2110 | 1.75 s | 1.8 s |
+
+![Long-prompt mix: throughput and short-request latency](docs/img/long_prompts.png)
 
 Chunking helps, but modestly: 3–5% throughput and a few percent of short-request
 latency. vLLM is ~1.5× ahead here, and the accounting says why. The extra wall
